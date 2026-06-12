@@ -1,0 +1,17 @@
+{
+  "listen_addr": "127.0.0.1:8080",
+  "upstream_url": "https://opencode.ai/zen/go",
+  "keys": [
+    "sk-opencode-go-key1",
+    "sk-opencode-go-key2",
+    "sk-opencode-go-key3"
+  ],
+  "strategy": "round_robin",
+  "cooldown_seconds": 60,
+  "health_check_timeout_seconds": 10,
+  "admin_user": "admin",
+  "admin_pass": "change-me-in-production",
+  "enable_prometheus": true,
+  "enable_logging": true,
+  "log_file": "/var/log/opencode-router.log"
+}

@@ -1,0 +1,13 @@
+{
+  "listen_addr": "127.0.0.1:8080",
+  "upstream_url": "https://opencode.ai/zen/go",
+  "keys": ["sk-opencode-go-your-key-here"],
+  "strategy": "round_robin",
+  "cooldown_seconds": 60,
+  "health_check_timeout_seconds": 10,
+  "admin_user": "admin",
+  "admin_pass": "",
+  "enable_prometheus": false,
+  "enable_logging": false,
+  "log_file": ""
+}

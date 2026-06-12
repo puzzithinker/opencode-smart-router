@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  opencode-router:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - OPENCODE_KEYS=${OPENCODE_KEYS}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    # Optional Prometheus (uncomment to enable)
+    # prometheus:
+    #   image: prom/prometheus:latest
+    #   volumes:
+    #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    #   ports:
+    #     - "9090:9090"

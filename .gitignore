@@ -1,0 +1,29 @@
+# Binary
+opencode-smart-router
+bin/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Omo internal
+.omo/
+
+# Config with secrets (root level only)
+/config.json
