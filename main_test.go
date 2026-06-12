@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,7 +32,7 @@ func setupTestGlobals(keys []string, strategy string) {
 		LogFile:                   "",
 	}
 	rotator = NewKeyRotator(keys, strategy)
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func setupTestGlobalsNoAuth(keys []string, strategy string) {
@@ -49,7 +50,7 @@ func setupTestGlobalsNoAuth(keys []string, strategy string) {
 		LogFile:                   "",
 	}
 	rotator = NewKeyRotator(keys, strategy)
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // --- Config Tests ---
@@ -644,7 +645,7 @@ func TestHealthHandler_UpstreamUnreachable(t *testing.T) {
 		EnablePrometheus:          false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -675,7 +676,7 @@ func TestHealthHandler_HealthyUpstream(t *testing.T) {
 		EnablePrometheus:          false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	w := httptest.NewRecorder()
@@ -724,7 +725,7 @@ func TestTransparentRetry_429ThenSuccess(t *testing.T) {
 		EnablePrometheus: false,
 	}
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rp := newReverseProxy(upstreamURL)
 	handler := proxyHandler(rp, rotator)
@@ -761,7 +762,7 @@ func TestTransparentRetry_401AllKeys(t *testing.T) {
 		EnablePrometheus: false,
 	}
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rp := newReverseProxy(upstreamURL)
 	handler := proxyHandler(rp, rotator)
@@ -802,7 +803,7 @@ func TestTransparentRetry_429AllKeys(t *testing.T) {
 		EnablePrometheus: false,
 	}
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rp := newReverseProxy(upstreamURL)
 	handler := proxyHandler(rp, rotator)
@@ -850,7 +851,7 @@ func TestForward5xxWithoutRetry(t *testing.T) {
 		EnablePrometheus: false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
-	logger = log.New(io.Discard, "", 0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	rp := newReverseProxy(upstreamURL)
 	handler := proxyHandler(rp, rotator)
@@ -867,5 +868,512 @@ func TestForward5xxWithoutRetry(t *testing.T) {
 
 	if rotator.keys[0].State != KeyHealthy {
 		t.Error("key should remain healthy after 5xx (upstream problem, not key problem)")
+	}
+}
+
+// --- New Test Cases ---
+
+func TestLoadConfigMissingFile(t *testing.T) {
+	_, err := LoadConfig("/nonexistent/path/config.json")
+	if err == nil {
+		t.Error("LoadConfig() should return error for missing file")
+	}
+}
+
+func TestLoadConfigInvalidJSON(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString("{invalid json}"); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	_, err = LoadConfig(tmpFile.Name())
+	if err == nil {
+		t.Error("LoadConfig() should return error for invalid JSON")
+	}
+}
+
+func TestLoadConfigEnvOverrideEmptyKeys(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	config := `{"keys": ["sk-original"], "strategy": "round_robin"}`
+	if _, err := tmpFile.WriteString(config); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	t.Setenv("OPENCODE_KEYS", "")
+
+	cfg, err := LoadConfig(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	// Empty OPENCODE_KEYS should NOT override config keys
+	if len(cfg.Keys) != 1 || cfg.Keys[0] != "sk-original" {
+		t.Errorf("Keys = %v, want [sk-original] (empty env should not override)", cfg.Keys)
+	}
+}
+
+func TestPickKeyRoundRobinWrapsAround(t *testing.T) {
+	setupTestGlobals([]string{"key0", "key1", "key2"}, "round_robin")
+
+	picks := make([]string, 4)
+	for i := 0; i < 3; i++ {
+		key, err := rotator.PickKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		picks[i] = key.RawKey
+	}
+
+	key, err := rotator.PickKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	picks[3] = key.RawKey
+
+	expected := []string{"key0", "key1", "key2", "key0"}
+	for i, got := range picks {
+		if got != expected[i] {
+			t.Errorf("pick %d = %q, want %q", i, got, expected[i])
+		}
+	}
+}
+
+func TestPickKeyLeastUsedAfterCooldown(t *testing.T) {
+	setupTestGlobals([]string{"key0", "key1"}, "least_used")
+
+	rotator.MarkCooldown(rotator.keys[0], 60*time.Second)
+
+	key, err := rotator.PickKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.RawKey != "key1" {
+		t.Errorf("PickKey = %q, want %q (should skip cooldown key)", key.RawKey, "key1")
+	}
+
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	key, err = rotator.PickKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.RawKey != "key0" {
+		t.Errorf("PickKey = %q, want %q (cooldown expired, should be available)", key.RawKey, "key0")
+	}
+}
+
+func TestPickKeySingleKeyDisabled(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	rotator.MarkDisabled(rotator.keys[0])
+
+	_, err := rotator.PickKey()
+	if err == nil {
+		t.Error("PickKey() should return error when single key is disabled")
+	}
+}
+
+func TestMarkCooldownSetsDuration(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	duration := 30 * time.Second
+	before := time.Now()
+	rotator.MarkCooldown(rotator.keys[0], duration)
+	after := time.Now()
+
+	rotator.keys[0].mu.Lock()
+	cooldownUntil := rotator.keys[0].CooldownUntil
+	state := rotator.keys[0].State
+	rotator.keys[0].mu.Unlock()
+
+	if state != KeyCooldown {
+		t.Errorf("State = %d, want %d (cooldown)", state, KeyCooldown)
+	}
+
+	// CooldownUntil should be approximately now + duration
+	minExpected := before.Add(duration)
+	maxExpected := after.Add(duration + time.Second)
+	if cooldownUntil.Before(minExpected) || cooldownUntil.After(maxExpected) {
+		t.Errorf("CooldownUntil = %v, want between %v and %v", cooldownUntil, minExpected, maxExpected)
+	}
+}
+
+func TestHealthyCountWithCooldown(t *testing.T) {
+	setupTestGlobals([]string{"key0", "key1", "key2"}, "round_robin")
+
+	rotator.keys[0].mu.Lock()
+	rotator.keys[0].State = KeyCooldown
+	rotator.keys[0].CooldownUntil = time.Now().Add(-time.Second)
+	rotator.keys[0].mu.Unlock()
+
+	rotator.MarkCooldown(rotator.keys[1], 60*time.Second)
+
+	// HealthyCount should count key0 (expired cooldown) and key2 (healthy) = 2
+	count := rotator.HealthyCount()
+	if count != 2 {
+		t.Errorf("HealthyCount() = %d, want 2 (1 expired cooldown + 1 healthy)", count)
+	}
+}
+
+func TestDisabledCount(t *testing.T) {
+	setupTestGlobals([]string{"key0", "key1", "key2", "key3"}, "round_robin")
+
+	if rotator.DisabledCount() != 0 {
+		t.Errorf("DisabledCount() = %d, want 0", rotator.DisabledCount())
+	}
+
+	rotator.MarkDisabled(rotator.keys[0])
+	if rotator.DisabledCount() != 1 {
+		t.Errorf("DisabledCount() = %d, want 1", rotator.DisabledCount())
+	}
+
+	rotator.MarkDisabled(rotator.keys[2])
+	if rotator.DisabledCount() != 2 {
+		t.Errorf("DisabledCount() = %d, want 2", rotator.DisabledCount())
+	}
+
+	if rotator.HealthyCount() != 2 {
+		t.Errorf("HealthyCount() = %d, want 2", rotator.HealthyCount())
+	}
+}
+
+func TestClassifyResponse_2xx(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("GET", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	err := classifyResponse(resp)
+	if err != nil {
+		t.Errorf("classifyResponse() error = %v, want nil for 2xx", err)
+	}
+
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("key state = %d, want %d (healthy)", key.State, KeyHealthy)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if holder.result.ShouldRetry {
+		t.Error("ShouldRetry = true, want false for 2xx")
+	}
+	if holder.result.StatusCode != 200 {
+		t.Errorf("StatusCode = %d, want 200", holder.result.StatusCode)
+	}
+}
+
+func TestClassifyResponse_5xx(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("GET", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 500,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	err := classifyResponse(resp)
+	if err != nil {
+		t.Errorf("classifyResponse() error = %v, want nil for 5xx", err)
+	}
+
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("key state = %d, want %d (healthy, 5xx should not mark key)", key.State, KeyHealthy)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if holder.result.ShouldRetry {
+		t.Error("ShouldRetry = true, want false for 5xx (should not retry)")
+	}
+	if holder.result.StatusCode != 500 {
+		t.Errorf("StatusCode = %d, want 500", holder.result.StatusCode)
+	}
+}
+
+func TestClassifyResponse_429RateLimit(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	body := `{"error":{"message":"rate limit exceeded","type":"rate_limit","code":"rate_limit_exceeded"}}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 429,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{},
+	}
+
+	err := classifyResponse(resp)
+	if err == nil {
+		t.Error("classifyResponse() should return error for 429 rate limit")
+	}
+
+	key.mu.Lock()
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if !holder.result.ShouldRetry {
+		t.Error("ShouldRetry = false, want true for 429 rate limit")
+	}
+	if holder.result.StatusCode != 429 {
+		t.Errorf("StatusCode = %d, want 429", holder.result.StatusCode)
+	}
+}
+
+func TestClassifyResponse_429InsufficientQuota(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	body := `{"error":{"message":"insufficient quota","type":"insufficient_quota","code":"insufficient_quota"}}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 429,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{},
+	}
+
+	err := classifyResponse(resp)
+	if err == nil {
+		t.Error("classifyResponse() should return error for 429 insufficient_quota")
+	}
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key state = %d, want %d (disabled)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if !holder.result.ShouldRetry {
+		t.Error("ShouldRetry = false, want true for 429 insufficient_quota")
+	}
+	if holder.result.StatusCode != 429 {
+		t.Errorf("StatusCode = %d, want 429", holder.result.StatusCode)
+	}
+}
+
+func TestClassifyResponse_401(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 401,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+	}
+
+	err := classifyResponse(resp)
+	if err == nil {
+		t.Error("classifyResponse() should return error for 401")
+	}
+
+	key.mu.Lock()
+	if key.State != KeyDisabled {
+		t.Errorf("key state = %d, want %d (disabled)", key.State, KeyDisabled)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if !holder.result.ShouldRetry {
+		t.Error("ShouldRetry = false, want true for 401")
+	}
+	if holder.result.StatusCode != 401 {
+		t.Errorf("StatusCode = %d, want 401", holder.result.StatusCode)
+	}
+}
+
+func TestWriteOpenAIError(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeOpenAIError(w, "test message", "test_type", "test_code", http.StatusTooManyRequests)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+
+	contentType := w.Header().Get("Content-Type")
+	if contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", contentType, "application/json")
+	}
+
+	var errResp OpenAIError
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if errResp.Error.Message != "test message" {
+		t.Errorf("message = %q, want %q", errResp.Error.Message, "test message")
+	}
+	if errResp.Error.Type != "test_type" {
+		t.Errorf("type = %q, want %q", errResp.Error.Type, "test_type")
+	}
+	if errResp.Error.Code != "test_code" {
+		t.Errorf("code = %q, want %q", errResp.Error.Code, "test_code")
+	}
+}
+
+func TestProxyHandler_SingleKeySuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer key0" {
+			t.Errorf("Authorization = %q, want %q", r.Header.Get("Authorization"), "Bearer key0")
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-123"}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+}
+
+func TestProxyHandler_RequestBodyPreservedOnRetry(t *testing.T) {
+	var bodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(body))
+
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer key0" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-123"}`))
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0", "key1"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL)
+	handler := proxyHandler(rp, rotator)
+
+	originalBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(originalBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (should retry and succeed)", w.Code, http.StatusOK)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 request bodies, got %d", len(bodies))
+	}
+
+	if bodies[0] != originalBody {
+		t.Errorf("first request body = %q, want %q", bodies[0], originalBody)
+	}
+	if bodies[1] != originalBody {
+		t.Errorf("second request body = %q, want %q (should be preserved on retry)", bodies[1], originalBody)
 	}
 }

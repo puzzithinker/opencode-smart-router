@@ -284,6 +284,17 @@ These defaults work well on a Raspberry Pi 4.
 | `clean` | `make clean` | Remove the `bin/` directory |
 | `test` | `make test` | Run Go tests |
 
+## Security
+
+The `/admin/stats` endpoint exposes key usage data and states. When `admin_pass` is empty, admin endpoints are **disabled entirely** and return 403.
+
+For production deployments:
+
+- Set `admin_pass` to a strong, unique password in `config.json` or via environment
+- Do not expose the router port to public networks without TLS (use a reverse proxy like nginx/Caddy for TLS termination)
+- The router binds to `127.0.0.1:8080` by default, which restricts access to localhost
+- API keys are never logged or exposed in stats responses (only masked versions are shown)
+
 ## License
 
 MIT License. See LICENSE for details.

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -22,6 +22,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var version = "dev"
 
 // --- Config ---
 
@@ -250,7 +252,7 @@ func (kr *KeyRotator) MarkSuccess(key *KeyEntry) {
 		keyHealthy.WithLabelValues(key.Key).Set(1)
 	}
 
-	logEvent("key_recovered", "key=%s", key.Key)
+	slog.Info("key_recovered", "key", key.Key)
 }
 
 func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
@@ -263,7 +265,7 @@ func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
 		keyHealthy.WithLabelValues(key.Key).Set(0)
 	}
 
-	logEvent("key_cooldown", "key=%s duration=%s", key.Key, duration)
+	slog.Info("key_cooldown", "key", key.Key, "duration", duration)
 }
 
 func (kr *KeyRotator) MarkDisabled(key *KeyEntry) {
@@ -275,7 +277,7 @@ func (kr *KeyRotator) MarkDisabled(key *KeyEntry) {
 		keyHealthy.WithLabelValues(key.Key).Set(0)
 	}
 
-	logEvent("key_disabled", "key=%s", key.Key)
+	slog.Info("key_disabled", "key", key.Key)
 }
 
 func (kr *KeyRotator) HealthyCount() int {
@@ -463,7 +465,7 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 				return
 			}
 
-			logEvent("key_selected", "key=%s strategy=%s attempt=%d", key.Key, rotator.strategy, attempt+1)
+			slog.Info("key_selected", "key", key.Key, "strategy", rotator.strategy, "attempt", attempt+1)
 
 			// Create a fresh request for each attempt
 			newReq := r.Clone(r.Context())
@@ -487,7 +489,7 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 			// Check classification result
 			if holder.result != nil && holder.result.ShouldRetry {
 				lastStatusCode = holder.result.StatusCode
-				logEvent("transparent_retry", "key=%s status=%d attempt=%d", key.Key, holder.result.StatusCode, attempt+1)
+				slog.Info("transparent_retry", "key", key.Key, "status", holder.result.StatusCode, "attempt", attempt+1)
 				// Discard buffer and try next key
 				continue
 			}
@@ -513,6 +515,26 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 }
 
 // --- Error Classification ---
+
+type KeyError struct {
+	Op   string
+	Key  string
+	Err  string
+}
+
+func (e *KeyError) Error() string { return e.Op + ": key " + e.Key + ": " + e.Err }
+
+type UpstreamError struct {
+	Err error
+}
+
+func (e *UpstreamError) Error() string { return "upstream: " + e.Err.Error() }
+
+type ConfigError struct {
+	Err error
+}
+
+func (e *ConfigError) Error() string { return "config: " + e.Err.Error() }
 
 type errorBody struct {
 	Error struct {
@@ -544,7 +566,7 @@ func classifyResponse(resp *http.Response) error {
 	if statusCode >= 200 && statusCode < 300 {
 		rotator.MarkSuccess(key)
 		recordMetrics()
-		logEvent("request_forwarded", "key=%s status=%d", key.Key, statusCode)
+		slog.Info("request_forwarded", "key", key.Key, "status", statusCode)
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: false, StatusCode: statusCode}
 		}
@@ -820,29 +842,22 @@ func statusGroup(code int) string {
 
 // --- Logging ---
 
-var (
-	logFile *os.File
-	logger  *log.Logger
-)
+var logFile *os.File
 
 func setupLogging() {
-	logger = log.New(os.Stdout, "", 0)
+	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(handler))
 
 	if cfg.EnableLogging && cfg.LogFile != "" {
 		f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			log.Printf("WARN: failed to open log file %s: %v, logging to stdout", cfg.LogFile, err)
+			slog.Warn("failed to open log file, logging to stdout", "path", cfg.LogFile, "error", err)
 		} else {
 			logFile = f
-			logger = log.New(f, "", 0)
+			handler = slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo})
+			slog.SetDefault(slog.New(handler))
 		}
 	}
-}
-
-func logEvent(event, format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	now := time.Now().UTC().Format(time.RFC3339)
-	logger.Printf("%s %s %s", now, event, msg)
 }
 
 // --- OpenAI Error Format ---
@@ -882,19 +897,21 @@ func main() {
 	var err error
 	cfg, err = LoadConfig(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		slog.Error("failed to load config", "error", err)
+	os.Exit(1)
 	}
 
 	setupLogging()
 
 	rotator = NewKeyRotator(cfg.Keys, cfg.Strategy)
 
-	logEvent("startup", "keys=%d strategy=%s listen=%s upstream=%s",
-		rotator.TotalCount(), cfg.Strategy, cfg.ListenAddr, cfg.UpstreamURL)
+	slog.Info("startup", "keys", rotator.TotalCount(), "strategy", cfg.Strategy, "listen", cfg.ListenAddr, "upstream", cfg.UpstreamURL)
+	slog.Info("startup", "version", version)
 
 	upstreamURL, err := url.Parse(cfg.UpstreamURL)
 	if err != nil {
-		log.Fatalf("Failed to parse upstream URL: %v", err)
+		slog.Error("failed to parse upstream URL", "error", err)
+	os.Exit(1)
 	}
 
 	rp := newReverseProxy(upstreamURL)
@@ -926,25 +943,27 @@ func main() {
 	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		logEvent("startup", "listening on %s", cfg.ListenAddr)
+		slog.Info("listening", "addr", cfg.ListenAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			slog.Error("server error", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-done
-	logEvent("shutdown", "received signal, shutting down gracefully...")
+	slog.Info("shutdown", "message", "received signal, shutting down gracefully")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server shutdown error: %v", err)
+		slog.Error("server shutdown error", "error", err)
+		os.Exit(1)
 	}
 
 	if logFile != nil {
 		logFile.Close()
 	}
 
-	logEvent("shutdown", "server stopped")
+	slog.Info("shutdown", "message", "server stopped")
 }
