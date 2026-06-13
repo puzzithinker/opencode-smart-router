@@ -168,8 +168,8 @@ echo "  Written: datasource, dashboard provider, and dashboard JSON"
 echo ""
 echo "[4/6] Updating docker-compose.yml with Prometheus and Grafana..."
 
-# Check if prometheus service already exists
-if grep -q "prometheus:" "${SCRIPT_DIR}/docker-compose.yml"; then
+# Check if an active (uncommented) prometheus service already exists
+if grep -q "^  prometheus:" "${SCRIPT_DIR}/docker-compose.yml"; then
     echo "  Prometheus service already in docker-compose.yml, skipping."
 else
     # We need to add the prometheus and grafana services
