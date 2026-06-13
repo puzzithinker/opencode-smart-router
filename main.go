@@ -396,7 +396,9 @@ func (b *bufferedResponseWriter) writeTo(w http.ResponseWriter) {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(b.statusCode)
-	b.body.WriteTo(w)
+	if _, err := b.body.WriteTo(w); err != nil {
+		slog.Error("failed to write buffered response", "error", err)
+	}
 }
 
 func newReverseProxy(upstreamURL *url.URL) *httputil.ReverseProxy {
@@ -696,7 +698,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		result["upstream"] = "no_healthy_keys"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result)
+		json.NewEncoder(w).Encode(result) //nolint:errcheck
 		return
 	}
 
@@ -709,7 +711,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		result["upstream"] = "url_error"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result)
+		json.NewEncoder(w).Encode(result) //nolint:errcheck
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+key.RawKey)
@@ -720,7 +722,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		result["upstream"] = "unreachable"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result)
+		json.NewEncoder(w).Encode(result) //nolint:errcheck
 		return
 	}
 	defer resp.Body.Close()
@@ -737,7 +739,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(result) //nolint:errcheck
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -768,7 +770,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	json.NewEncoder(w).Encode(result) //nolint:errcheck
 }
 
 // --- Metrics ---

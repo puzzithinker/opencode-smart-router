@@ -621,7 +621,9 @@ func TestHealthHandler_AllKeysDisabled(t *testing.T) {
 	}
 
 	var result map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &result)
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
 	if result["status"] != "unhealthy" {
 		t.Errorf("status = %v, want unhealthy", result["status"])
 	}
@@ -660,7 +662,7 @@ func TestHealthHandler_UpstreamUnreachable(t *testing.T) {
 func TestHealthHandler_HealthyUpstream(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"data":[]}`))
+		w.Write([]byte(`{"data":[]}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -688,7 +690,9 @@ func TestHealthHandler_HealthyUpstream(t *testing.T) {
 	}
 
 	var result map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &result)
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
 	if result["status"] != "healthy" {
 		t.Errorf("status = %v, want healthy", result["status"])
 	}
@@ -706,11 +710,11 @@ func TestTransparentRetry_429ThenSuccess(t *testing.T) {
 		auth := r.Header.Get("Authorization")
 		if auth == "Bearer key0" {
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`))
+			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`)) //nolint:errcheck
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"chatcmpl-123"}`))
+		w.Write([]byte(`{"id":"chatcmpl-123"}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -747,7 +751,7 @@ func TestTransparentRetry_429ThenSuccess(t *testing.T) {
 func TestTransparentRetry_401AllKeys(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error":{"message":"invalid api key","type":"invalid_request_error","code":"invalid_api_key"}}`))
+		w.Write([]byte(`{"error":{"message":"invalid api key","type":"invalid_request_error","code":"invalid_api_key"}}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -788,7 +792,7 @@ func TestTransparentRetry_401AllKeys(t *testing.T) {
 func TestTransparentRetry_429AllKeys(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`))
+		w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -836,7 +840,7 @@ func TestPermanentDisable_401(t *testing.T) {
 func TestForward5xxWithoutRetry(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte(`{"error":{"message":"bad gateway"}}`))
+		w.Write([]byte(`{"error":{"message":"bad gateway"}}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -1291,7 +1295,7 @@ func TestProxyHandler_SingleKeySuccess(t *testing.T) {
 			t.Errorf("Authorization = %q, want %q", r.Header.Get("Authorization"), "Bearer key0")
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"chatcmpl-123"}`))
+		w.Write([]byte(`{"id":"chatcmpl-123"}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
@@ -1331,11 +1335,11 @@ func TestProxyHandler_RequestBodyPreservedOnRetry(t *testing.T) {
 		auth := r.Header.Get("Authorization")
 		if auth == "Bearer key0" {
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`))
+			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`)) //nolint:errcheck
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"id":"chatcmpl-123"}`))
+		w.Write([]byte(`{"id":"chatcmpl-123"}`)) //nolint:errcheck
 	}))
 	defer upstream.Close()
 
