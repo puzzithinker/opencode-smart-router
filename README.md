@@ -88,7 +88,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_addr` | string | `127.0.0.1:8080` | HTTP bind address |
+| `listen_addr` | string | `0.0.0.0:8080` | HTTP bind address. Use `127.0.0.1` for localhost-only, `0.0.0.0` for Docker |
 | `upstream_url` | string | `https://opencode.ai/zen/go` | OpenCode Go API base URL |
 | `keys` | []string | (required) | API keys to rotate |
 | `strategy` | string | `round_robin` | `round_robin` or `least_used` |
@@ -346,7 +346,7 @@ For production deployments:
 
 - Set `admin_pass` to a strong, unique password in `config.json` or via environment
 - Do not expose the router port to public networks without TLS (use a reverse proxy like nginx/Caddy for TLS termination)
-- The router binds to `127.0.0.1:8080` by default, which restricts access to localhost
+- The router binds to `0.0.0.0:8080` by default (required for Docker; use `127.0.0.1:8080` for localhost-only)
 - API keys are never logged or exposed in stats responses (only masked versions are shown)
 
 ## License

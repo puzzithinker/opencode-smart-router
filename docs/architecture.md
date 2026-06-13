@@ -284,7 +284,7 @@ Default path is `config.json`. Override with `OPENCODE_CONFIG` environment varia
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `listen_addr` | string | `127.0.0.1:8080` | HTTP bind address |
+| `listen_addr` | string | `0.0.0.0:8080` | HTTP bind address. Use `127.0.0.1` for localhost-only, `0.0.0.0` for Docker |
 | `upstream_url` | string | `https://opencode.ai/zen/go` | OpenCode Go API base URL |
 | `keys` | []string | (required) | API keys to rotate |
 | `strategy` | string | `round_robin` | `round_robin` or `least_used` |

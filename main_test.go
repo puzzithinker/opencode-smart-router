@@ -19,7 +19,7 @@ import (
 
 func setupTestGlobals(keys []string, strategy string) {
 	cfg = &Config{
-		ListenAddr:                "127.0.0.1:8080",
+		ListenAddr:                "0.0.0.0:8080",
 		UpstreamURL:               "https://opencode.ai/zen/go",
 		Keys:                      keys,
 		Strategy:                  strategy,
@@ -37,7 +37,7 @@ func setupTestGlobals(keys []string, strategy string) {
 
 func setupTestGlobalsNoAuth(keys []string, strategy string) {
 	cfg = &Config{
-		ListenAddr:                "127.0.0.1:8080",
+		ListenAddr:                "0.0.0.0:8080",
 		UpstreamURL:               "https://opencode.ai/zen/go",
 		Keys:                      keys,
 		Strategy:                  strategy,
@@ -145,8 +145,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
 
-	if cfg.ListenAddr != "127.0.0.1:8080" {
-		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, "127.0.0.1:8080")
+	if cfg.ListenAddr != "0.0.0.0:8080" {
+		t.Errorf("ListenAddr = %q, want %q", cfg.ListenAddr, "0.0.0.0:8080")
 	}
 	if cfg.UpstreamURL != "https://opencode.ai/zen/go" {
 		t.Errorf("UpstreamURL = %q, want %q", cfg.UpstreamURL, "https://opencode.ai/zen/go")

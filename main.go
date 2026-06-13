@@ -54,7 +54,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	// Apply defaults
 	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = "127.0.0.1:8080"
+		cfg.ListenAddr = "0.0.0.0:8080"
 	}
 	if cfg.UpstreamURL == "" {
 		cfg.UpstreamURL = "https://opencode.ai/zen/go"
