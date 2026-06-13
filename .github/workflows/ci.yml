@@ -9,8 +9,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +18,8 @@ jobs:
           cache: true
 
       - name: Build
+        env:
+          CGO_ENABLED: 0
         run: go build ./...
 
       - name: Vet
