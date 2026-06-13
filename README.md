@@ -2,7 +2,7 @@
 
 A lightweight, deterministic HTTP proxy for rotating multiple OpenCode Go API keys.
 
-![Go Version](https://img.shields.io/badge/go-1.21+-blue)
+![Go Version](https://img.shields.io/badge/go-1.22+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Overview
@@ -11,7 +11,7 @@ opencode-smart-router sits between AI coding agents (like Hermes Agent) and the 
 
 When a key fails, hits a rate limit, or returns an authentication error, the router transparently retries with the next available key. The caller never sees the retry, only the final success or a clean error response.
 
-The project ships as a single static binary with one external dependency (Prometheus client library). It is designed to run on resource-constrained hardware like a Raspberry Pi 4.
+The project ships as a single static binary with one external dependency (Prometheus client library). It uses structured logging (`slog`) for JSON-compatible output and supports build-time version injection. It is designed to run on resource-constrained hardware like a Raspberry Pi 4.
 
 ## Features
 
@@ -22,6 +22,8 @@ The project ships as a single static binary with one external dependency (Promet
 - **Admin stats endpoint** with basic auth for key monitoring
 - **Prometheus metrics** for requests, key usage, health, and latency
 - **Graceful shutdown** with in-flight request draining
+- **Structured logging** with `slog` (JSON-compatible, file or stdout)
+- **Build-time version injection** via `-ldflags`
 - **Docker and systemd** deployment ready
 
 ## Quick Start
@@ -33,6 +35,16 @@ Build the binary:
 ```bash
 make build
 ```
+
+To include a version string:
+
+```bash
+VERSION=v1.0.0 make build
+./bin/opencode-router
+# Output includes: level=INFO msg=startup version=v1.0.0
+```
+
+Without `VERSION`, the binary defaults to the git commit hash or `dev`.
 
 Set your API keys and run:
 
@@ -277,12 +289,52 @@ These defaults work well on a Raspberry Pi 4.
 
 | Target | Command | Description |
 |--------|---------|-------------|
-| `build` | `make build` | Compile for the current platform |
+| `build` | `make build` | Compile for the current platform (with version injection) |
 | `build-arm64` | `make build-arm64` | Cross-compile for Linux ARM64 |
 | `run` | `make run` | Build and run locally |
 | `docker` | `make docker` | Build the Docker image |
+| `test` | `make test` | Run tests with race detector |
+| `lint` | `make lint` | Run golangci-lint |
+| `tidy` | `make tidy` | Run `go mod tidy` and check for diffs |
+| `ci` | `make ci` | Run tidy + lint + test + build + build-arm64 |
 | `clean` | `make clean` | Remove the `bin/` directory |
-| `test` | `make test` | Run Go tests |
+| `version` | `make version` | Print the current version string |
+
+## Prometheus Monitoring
+
+Enable metrics in your config:
+
+```json
+{
+  "enable_prometheus": true
+}
+```
+
+This exposes a `/metrics` endpoint that Prometheus can scrape. See [docs/prometheus-monitoring.md](docs/prometheus-monitoring.md) for a complete setup guide including Grafana dashboards and alerting rules.
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `opencode_router_requests_total` | Counter | `key`, `status_group` | Total requests per key, grouped by status (2xx, 4xx, 5xx) |
+| `opencode_router_key_usage_total` | Counter | `key` | Times each key was selected by the rotator |
+| `opencode_router_key_healthy` | Gauge | `key` | 1 if healthy, 0 if in cooldown or disabled |
+| `opencode_router_request_duration_seconds` | Histogram | `key` | Request latency distribution |
+
+Labels use masked keys (e.g., `sk-ab1...xyz`) to avoid exposing raw secrets.
+
+### Quick Prometheus Setup
+
+Add this to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'opencode-router'
+    static_configs:
+      - targets: ['127.0.0.1:8080']
+```
+
+For full setup with Grafana dashboards and alerting, see the [monitoring guide](docs/prometheus-monitoring.md).
 
 ## Security
 

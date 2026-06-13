@@ -2,7 +2,7 @@
 
 ## Development Setup
 
-1. Install Go 1.21 or later
+1. Install Go 1.22 or later
 2. Clone the repository
 3. Run `make build` to compile
 4. Run `make test` to run tests
@@ -21,7 +21,11 @@ All changes must pass:
 
 - `go vet ./...` — no warnings
 - `go test -v -race ./...` — all tests pass
+- `golangci-lint run ./...` — no lint errors
 - `go build` — clean compilation
+- `go mod tidy` — no diff in go.mod/go.sum
+
+Run `make ci` to check everything at once.
 
 ## Code Style
 

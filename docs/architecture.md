@@ -6,7 +6,7 @@ opencode-smart-router is a lightweight, deterministic HTTP proxy written in Go. 
 
 When a key fails, hits a rate limit, or returns an authentication error, the router transparently retries with the next available key. The caller never sees the retry, only the final success or a clean error response.
 
-The project is built as a single static binary with one external dependency (Prometheus client library). It is designed to run on resource-constrained hardware like a Raspberry Pi 4.
+The project is built as a single static binary with one external dependency (Prometheus client library). It uses Go 1.22+ features including `log/slog` for structured logging and `httputil.ReverseProxy` with the `Rewrite` API. It is designed to run on resource-constrained hardware like a Raspberry Pi 4.
 
 ---
 
@@ -23,7 +23,8 @@ All logic lives in `main.go`. The file is organized into clearly marked sections
 5. **Middleware** — Basic auth for admin endpoints
 6. **Handlers** — `/health`, `/admin/stats`
 7. **Metrics** — Prometheus counters, gauges, and histograms
-8. **Logging** — Structured event logging to stdout or file
+8. **Logging** — Structured logging with `log/slog`, JSON-compatible output to stdout or file
+9. **Custom Errors** — `KeyError`, `UpstreamError`, `ConfigError` for typed error handling
 9. **OpenAI Error Format** — Standard error response shape
 10. **Main** — Wiring, signal handling, graceful shutdown
 
@@ -227,7 +228,47 @@ This keeps cardinality low while still distinguishing success from failure class
 
 ### Runtime Enable/Disable
 
-If `enable_prometheus` is false, no metrics are registered and `/metrics` is not mounted. The Prometheus client library is still compiled into the binary, but it consumes no resources at runtime.
+If `enable_prometheus` is false, no metrics are registered and `/metrics` is not mounted. The Prometheus client library is still compiled into the binary, but it consumes no resources at runtime. See [docs/prometheus-monitoring.md](prometheus-monitoring.md) for complete setup instructions including Grafana dashboards and alerting rules.
+
+### Structured Logging
+
+The router uses Go's `log/slog` package for structured logging. All log entries use key-value pairs for machine-parseable output:
+
+```
+time=2026-06-13T12:00:00.000Z level=INFO msg=key_selected key=sk-ab1...xyz strategy=round_robin attempt=1
+time=2026-06-13T12:00:01.000Z level=INFO msg=key_cooldown key=sk-ab1...xyz duration=30s
+time=2026-06-13T12:00:02.000Z level=INFO msg=key_disabled key=sk-ab1...xyz
+time=2026-06-13T12:00:03.000Z level=INFO msg=transparent_retry key=sk-ab1...xyz status=429 attempt=2
+time=2026-06-13T12:00:04.000Z level=INFO msg=request_forwarded key=sk-cd2...lmn status=200
+```
+
+When `enable_logging` is true and `log_file` is set, output goes to the specified file. Otherwise, output goes to stdout with the `slog.TextHandler`.
+
+Log events: `key_selected`, `key_cooldown`, `key_disabled`, `key_recovered`, `request_forwarded`, `transparent_retry`, `startup`, `listening`, `shutdown`.
+
+### Version Injection
+
+The binary includes a `version` variable injected at build time via `-ldflags`:
+
+```bash
+make build  # uses git describe --tags --always or "dev"
+VERSION=v1.0.0 make build  # explicit version
+```
+
+The version is logged at startup:
+
+```
+level=INFO msg=startup keys=3 strategy=round_robin listen=127.0.0.1:8080 upstream=https://opencode.ai/zen/go
+level=INFO msg=startup version=v1.0.0
+```
+
+### Custom Error Types
+
+The router defines typed errors for common failure modes:
+
+- `KeyError` — key rotation failures (unavailable keys, disabled state)
+- `UpstreamError` — upstream connection failures (wrapped original error)
+- `ConfigError` — configuration parsing and validation failures
 
 ---
 
@@ -276,7 +317,7 @@ If validation fails, the process exits with a fatal error before starting the se
 
 The `Dockerfile` uses a multi-stage build:
 
-1. **Builder**: `golang:1.22-alpine` compiles a static binary with `CGO_ENABLED=0` and `-ldflags="-w -s"`
+1. **Builder**: `golang:1.23-alpine` compiles a static binary with `CGO_ENABLED=0` and `-ldflags="-w -s -X main.version=${VERSION}"`
 2. **Runner**: `gcr.io/distroless/static-debian12:latest` runs the binary with no shell, no package manager, and minimal attack surface
 
 The container runs as the `nonroot` user (UID 65534), which is built into the distroless image. Port 8080 is exposed.
@@ -314,8 +355,9 @@ The project is tuned for low-resource environments:
 
 ```
 opencode-smart-router/
-├── main.go                          # All business logic (939 lines)
-├── go.mod                           # Go module definition (Go 1.21, Prometheus client)
+├── main.go                          # All business logic (~970 lines)
+├── main_test.go                     # Unit and integration tests (49 tests)
+├── go.mod                           # Go module definition (Go 1.22, Prometheus client)
 ├── go.sum                           # Dependency checksums
 ├── Makefile                         # Build, cross-compile (arm64), Docker, test targets
 ├── Dockerfile                       # Multi-stage build, distroless, non-root
@@ -330,7 +372,10 @@ opencode-smart-router/
 ├── examples/
 │   └── config.json                  # Realistic example with 3 keys
 └── docs/
-    └── architecture.md              # This document
+    ├── architecture.md              # This document
+    ├── bugs-fixed.md                # All bugs found and fixed during development
+    ├── prometheus-monitoring.md     # Prometheus + Grafana setup guide
+    └── raspberry-pi-deployment.md   # RPi 4 deployment guide
 ```
 
 ---
