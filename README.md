@@ -61,6 +61,8 @@ The router listens on `127.0.0.1:8080` by default.
 docker compose up -d --build
 ```
 
+The container mounts `./config.json` as read-only inside the container. Make sure your `config.json` exists in the project root (copy from `config.example.json` and add your keys).
+
 Docker Compose binds to `127.0.0.1:8080` with a 256 MB memory limit and 0.5 CPU cap.
 
 ### Using with OpenCode / Hermes Agent

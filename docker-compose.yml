@@ -1,8 +1,13 @@
 services:
   opencode-router:
-    build: .
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
     ports:
       - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.json:/config.json:ro
     environment:
       - OPENCODE_KEYS=${OPENCODE_KEYS}
     restart: unless-stopped
