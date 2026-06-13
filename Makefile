@@ -1,4 +1,4 @@
-.PHONY: build build-arm64 run docker clean test version
+.PHONY: build build-arm64 run docker clean test lint tidy ci version
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
@@ -12,13 +12,22 @@ run: build
 	./bin/opencode-router
 
 docker:
-	docker build -t opencode-router .
+	docker build --build-arg VERSION=$(VERSION) -t opencode-router .
 
 clean:
 	rm -rf bin/
 
 test:
-	go test ./...
+	go test -v -race ./...
+
+lint:
+	golangci-lint run ./...
+
+tidy:
+	go mod tidy
+	git diff --exit-code go.mod go.sum
+
+ci: tidy lint test build build-arm64
 
 version:
 	@echo $(VERSION)

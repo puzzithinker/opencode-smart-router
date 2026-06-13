@@ -14,16 +14,31 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.21"
+          go-version: "1.23"
           cache: true
 
-      - name: Build
-        env:
-          CGO_ENABLED: 0
-        run: go build ./...
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Vet
         run: go vet ./...
 
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+
       - name: Test
         run: go test -v -race ./...
+
+      - name: Build (amd64)
+        env:
+          CGO_ENABLED: 0
+        run: go build -ldflags="-X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o bin/opencode-router .
+
+      - name: Build (arm64)
+        env:
+          CGO_ENABLED: 0
+        run: GOOS=linux GOARCH=arm64 go build -ldflags="-X main.version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" -o bin/opencode-router-linux-arm64 .
