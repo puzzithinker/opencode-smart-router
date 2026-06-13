@@ -880,7 +880,7 @@ func writeOpenAIError(w http.ResponseWriter, message, errType, code string, stat
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(errResp)
+	json.NewEncoder(w).Encode(errResp) //nolint:errcheck
 }
 
 // --- Main ---
