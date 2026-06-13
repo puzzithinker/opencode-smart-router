@@ -16,7 +16,7 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY .
+COPY . .
 
 # Build with CGO disabled for static binary
 # GOGC=50 reduces memory usage during compilation
