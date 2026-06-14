@@ -164,32 +164,29 @@ The rotator scans all keys and picks the one with the lowest usage count that is
 Each API key moves through three states:
 
 ```
-                    +----------+
-                    | HEALTHY  |
-                    +----------+
-                     |        |
-     cooldown expires|        | 401 / 403 / insufficient_quota
-                     |        v
-                     |   +----------+
-                     |   | DISABLED |
-                     |   +----------+
-                     v
+                    +------------+
+                    |  HEALTHY   |
+                    +------------+
+                    /    |       \
+        401/403/429 |    |        | insufficient_quota
+          (cooldown)|    |        | (permanent disable)
+                    v    |        v
+              +----------+  +----------+
+              | COOLDOWN |  | DISABLED |
+              +----------+  +----------+
+                    |
+           cooldown expires
+                    v
               +----------+
-              | COOLDOWN |
-              +----------+
-                   |
-                   | 429 / timeout
-                   v
-              +----------+
-              | HEALTHY  |
+              |  HEALTHY  |
               +----------+
 ```
 
 | State | Meaning |
 |-------|---------|
 | `HEALTHY` | Key is available for use. This is the default state. |
-| `COOLDOWN` | Key is temporarily paused after a rate limit or timeout. It returns to healthy automatically when the cooldown period expires. |
-| `DISABLED` | Key is permanently removed from rotation after an authentication failure or quota exhaustion. Disabled keys never recover automatically. |
+| `COOLDOWN` | Key is temporarily paused after a rate limit (429), auth failure (401/403), or timeout. It returns to healthy automatically when the cooldown period expires. |
+| `DISABLED` | Key is permanently removed from rotation after quota exhaustion (`insufficient_quota`). Auth failures (401/403) trigger cooldown, not disable, since they can be transient. |
 
 ## Transparent Retry
 

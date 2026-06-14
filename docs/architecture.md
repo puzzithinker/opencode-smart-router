@@ -63,15 +63,15 @@ Each API key is wrapped in a `KeyEntry` with three possible states:
 | State | Meaning | Transition Trigger |
 |-------|---------|-------------------|
 | `HEALTHY` | Key is available for use | Default state; entered after cooldown expires or on success |
-| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit or transport timeout |
-| `DISABLED` | Key is permanently removed from rotation | Entered on 401, 403, or 429 with `insufficient_quota` |
+| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit, 401/403 auth failure, or transport timeout |
+| `DISABLED` | Key is permanently removed from rotation | Entered only on 429 with `insufficient_quota` |
 
 Transitions:
 
-- `HEALTHY --> COOLDOWN`: Rate limit (429) or timeout
+- `HEALTHY --> COOLDOWN`: Rate limit (429), auth failure (401/403), or timeout
 - `COOLDOWN --> HEALTHY`: Cooldown period expires (checked at pick time)
-- `HEALTHY --> DISABLED`: Authentication failure (401/403) or quota exhaustion
-- `COOLDOWN --> DISABLED`: Never happens directly; only via HEALTHY
+- `HEALTHY --> DISABLED`: Quota exhaustion (`insufficient_quota` on 429)
+- 401/403 go to COOLDOWN (not DISABLED) because auth failures can be transient
 
 ### Selection Strategies
 
@@ -146,7 +146,7 @@ The `classifyResponse` function maps upstream status codes to actions:
 | Status Code | Action | Retry? | Key State Change |
 |-------------|--------|--------|-----------------|
 | 2xx | Forward to client | No | Mark `HEALTHY` |
-| 401 / 403 | Auth failure | Yes (next key) | Mark `DISABLED` |
+| 401 / 403 | Auth failure | Yes (next key) | Mark `COOLDOWN` |
 | 429 + `insufficient_quota` | Quota exhausted | Yes (next key) | Mark `DISABLED` |
 | 429 (other) | Rate limited | Yes (next key) | Mark `COOLDOWN` with `Retry-After` or default duration |
 | 5xx | Upstream error | No | None (forward error to client) |

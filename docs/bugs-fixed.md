@@ -14,6 +14,7 @@ This document records every bug discovered during the implementation and testing
 | 4 | Low | `main_test.go` — `TestMaskKey` | Test expected incorrect masking result | Fixed |
 | 5 | Low | `main_test.go` — `TestPickKeyLeastUsed` | Test expected wrong key on tie-break | Fixed |
 | 6 | Low | `main_test.go` — `TestPickKeyCooldownExpires` | Flaky sleep-based cooldown expiration test | Fixed |
+| 7 | Critical | `main.go` — `classifyResponse()` | 401/403 permanently disabled keys on transient auth failures | Fixed |
 
 ---
 
@@ -140,6 +141,29 @@ time.Sleep(2 * time.Nanosecond)
 // After (deterministic)
 key.State = KeyCooldown
 key.CooldownUntil = time.Now().Add(-time.Second)
+```
+
+---
+
+### BUG-7: 401/403 permanently disabled keys on transient auth failures
+
+- **Severity**: Critical
+- **File**: `main.go`, `classifyResponse()` function
+- **Symptom**: Both API keys got 401 from OpenCode at the same time (transient auth service hiccup). The router permanently disabled both keys, making it completely unresponsive until manual restart. Health endpoint reported `{"status":"unhealthy","disabled_keys":2,"healthy_keys":0,"upstream":"no_healthy_keys"}`.
+- **Root Cause**: `classifyResponse` treated 401/403 as permanent auth failures, calling `MarkDisabled()` which sets `KeyState = KeyDisabled`. Since `MarkSuccess` is guarded to never recover disabled keys, a transient 401 (e.g., brief auth service outage, token rotation delay) permanently killed the key with no recovery path except restart.
+- **Impact**: Complete service outage from a single transient auth failure. The router's own resilience mechanism made it *less* resilient than direct API access.
+- **Fix**: Changed 401/403 handling from `MarkDisabled` (permanent) to `MarkCooldown` (temporary). Keys now enter cooldown for `cooldown_seconds` and automatically recover. Only `insufficient_quota` on 429 responses permanently disables keys.
+
+```go
+// Before (permanent — kills keys on any 401/403)
+if statusCode == 401 || statusCode == 403 {
+    rotator.MarkDisabled(key)
+}
+
+// After (transient — cooldown allows recovery)
+if statusCode == 401 || statusCode == 403 {
+    rotator.MarkCooldown(key, time.Duration(cfg.CooldownSeconds)*time.Second)
+}
 ```
 
 ---

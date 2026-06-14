@@ -200,13 +200,13 @@ If `healthy_keys` is 0 or `upstream` is `unreachable`, the router cannot reach t
 
 ### Agent returns 401 or 403
 
-The router's configured keys are invalid or expired. Check `/admin/stats` — keys with `state: "disabled"` have failed authentication:
+The router's keys received an auth failure from the upstream. Keys that hit 401/403 go into **cooldown** (not disabled) — they recover automatically after `cooldown_seconds`. If this persists, the keys may be invalid or expired. Check `/admin/stats`:
 
 ```bash
 curl -u admin:your-password http://127.0.0.1:8080/admin/stats | python3 -m json.tool
 ```
 
-Replace disabled keys by updating `OPENCODE_KEYS` or `config.json` and restart the router.
+Keys in `cooldown` state will recover. Keys in `disabled` state (from `insufficient_quota`) need replacement — update `OPENCODE_KEYS` or `config.json` and restart.
 
 ### Agent returns 429 (Too Many Requests)
 
