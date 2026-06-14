@@ -92,7 +92,8 @@ Configuration is loaded from `config.json` by default. Override the path with th
 | `upstream_url` | string | `https://opencode.ai/zen/go` | OpenCode Go API base URL |
 | `keys` | []string | (required) | API keys to rotate |
 | `strategy` | string | `round_robin` | `round_robin` or `least_used` |
-| `cooldown_seconds` | int | `60` | Default cooldown duration for rate-limited keys |
+| `cooldown_seconds` | int | `60` | Cooldown duration for rate-limited keys (429) |
+| `auth_cooldown_seconds` | int | `10` | Cooldown duration for auth failures (401/403) |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty string disables admin endpoints |
@@ -115,7 +116,8 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "upstream_url": "https://opencode.ai/zen/go",
   "keys": ["sk-opencode-go-your-key-here"],
   "strategy": "round_robin",
-  "cooldown_seconds": 60,
+"cooldown_seconds": 60,
+  "auth_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "",
@@ -123,11 +125,8 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "enable_logging": false,
   "log_file": ""
 }
-```
 
 ### Full Example Config
-
-`examples/config.json`:
 
 ```json
 {
@@ -140,6 +139,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
   ],
   "strategy": "round_robin",
   "cooldown_seconds": 60,
+  "auth_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "change-me-in-production",

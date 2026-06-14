@@ -146,7 +146,7 @@ The `classifyResponse` function maps upstream status codes to actions:
 | Status Code | Action | Retry? | Key State Change |
 |-------------|--------|--------|-----------------|
 | 2xx | Forward to client | No | Mark `HEALTHY` |
-| 401 / 403 | Auth failure | Yes (next key) | Mark `COOLDOWN` |
+| 401 / 403 | Auth failure | Yes (next key) | Mark `COOLDOWN` for `auth_cooldown_seconds` (default 10s) |
 | 429 + `insufficient_quota` | Quota exhausted | Yes (next key) | Mark `DISABLED` |
 | 429 (other) | Rate limited | Yes (next key) | Mark `COOLDOWN` with `Retry-After` or default duration |
 | 5xx | Upstream error | No | None (forward error to client) |
