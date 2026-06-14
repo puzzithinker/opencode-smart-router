@@ -335,9 +335,16 @@ The container runs as the `nonroot` user (UID 65534), which is built into the di
 - `Type=oneshot` with `RemainAfterExit=yes`
 - `ExecStart` runs `docker compose up -d`
 - `ExecStop` runs `docker compose down`
-- Depends on `docker.service`
+- `Wants=docker.service` (starts after Docker)
+- Contains `__WORKINGDIR__` placeholder — must be replaced with your project path before installing
 
-Install by copying the unit file to `/etc/systemd/system/` and running `systemctl enable --now opencode-router`.
+Install from your project directory:
+
+```bash
+sed "s|__WORKINGDIR__|$(pwd)|" deploy/systemd/opencode-router.service | sudo tee /etc/systemd/system/opencode-router.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now opencode-router
+```
 
 ### Resource Limits
 

@@ -125,13 +125,17 @@ curl -u admin:change-me-in-production http://127.0.0.1:8080/admin/stats
 
 ## Step 6: Run as a systemd Service
 
-The project includes a systemd unit file for Docker Compose:
+The project includes a systemd unit file for Docker Compose. The unit file contains a `__WORKINGDIR__` placeholder that must be replaced with your actual project path.
+
+From your project directory:
 
 ```bash
-sudo cp deploy/systemd/opencode-router.service /etc/systemd/system/
+sed "s|__WORKINGDIR__|$(pwd)|" deploy/systemd/opencode-router.service | sudo tee /etc/systemd/system/opencode-router.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now opencode-router
 ```
+
+Or simply run `./setup.sh` which handles this automatically in step [9/9].
 
 Check status:
 

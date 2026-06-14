@@ -265,15 +265,15 @@ docker compose up -d --build
 
 ### Systemd
 
-Copy the unit file and enable it:
+Install the unit file (this replaces `__WORKINGDIR__` with your project path automatically):
 
 ```bash
-sudo cp deploy/systemd/opencode-router.service /etc/systemd/system/
+sed "s|__WORKINGDIR__|$(pwd)|" deploy/systemd/opencode-router.service | sudo tee /etc/systemd/system/opencode-router.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now opencode-router
 ```
 
-The unit runs `docker compose up -d` on start and `docker compose down` on stop.
+Or simply run `./setup.sh` which handles this in step [9/9].
 
 ### Resource Limits
 
