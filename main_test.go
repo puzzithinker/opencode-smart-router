@@ -781,11 +781,11 @@ func TestTransparentRetry_401AllKeys(t *testing.T) {
 		t.Errorf("status = %d, want %d (all keys should fail with 401)", w.Code, http.StatusUnauthorized)
 	}
 
-	if rotator.keys[0].State != KeyDisabled {
-		t.Error("key0 should be disabled after 401")
+	if rotator.keys[0].State != KeyCooldown {
+		t.Error("key0 should be in cooldown after 401")
 	}
-	if rotator.keys[1].State != KeyDisabled {
-		t.Error("key1 should be disabled after 401")
+	if rotator.keys[1].State != KeyCooldown {
+		t.Error("key1 should be in cooldown after 401")
 	}
 }
 
@@ -823,7 +823,7 @@ func TestTransparentRetry_429AllKeys(t *testing.T) {
 	}
 }
 
-func TestPermanentDisable_401(t *testing.T) {
+func TestPermanentDisable_insufficientQuota(t *testing.T) {
 	setupTestGlobals([]string{"key0"}, "round_robin")
 	rotator.MarkDisabled(rotator.keys[0])
 
@@ -1078,9 +1078,9 @@ func TestClassifyResponse_2xx(t *testing.T) {
 		t.Errorf("classifyResponse() error = %v, want nil for 2xx", err)
 	}
 
-	key.mu.Lock()
-	if key.State != KeyHealthy {
-		t.Errorf("key state = %d, want %d (healthy)", key.State, KeyHealthy)
+key.mu.Lock()
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
 	}
 	key.mu.Unlock()
 
@@ -1245,8 +1245,8 @@ func TestClassifyResponse_401(t *testing.T) {
 	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
 	}
 	key.mu.Unlock()
 

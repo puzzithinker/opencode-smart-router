@@ -584,14 +584,16 @@ func classifyResponse(resp *http.Response) error {
 		return nil
 	}
 
-	// 401/403 — key is invalid
+	// 401/403 — auth failure, treat as transient (cooldown) rather than permanent disable.
+	// Transient auth failures (expired tokens, brief service hiccups) should recover automatically.
+	// Only insufficient_quota (parsed from 429 responses) permanently disables a key.
 	if statusCode == 401 || statusCode == 403 {
-		rotator.MarkDisabled(key)
+		rotator.MarkCooldown(key, time.Duration(cfg.CooldownSeconds)*time.Second)
 		recordMetrics()
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 		}
-		return fmt.Errorf("key disabled: status %d", statusCode)
+		return fmt.Errorf("key cooldown: status %d", statusCode)
 	}
 
 	// 429 — rate limit or insufficient quota
