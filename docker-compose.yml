@@ -11,6 +11,8 @@ services:
     environment:
       - OPENCODE_KEYS=${OPENCODE_KEYS}
     restart: unless-stopped
+    networks:
+      - routers
     deploy:
       resources:
         limits:
@@ -23,6 +25,8 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
+    networks:
+      - routers
     restart: unless-stopped
     deploy:
       resources:
@@ -40,12 +44,19 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - routers
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: 128M
           cpus: "0.25"
+
+networks:
+  routers:
+    name: smart-routers
+    external: true
 
 volumes:
   grafana-storage:

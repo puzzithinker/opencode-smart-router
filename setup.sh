@@ -108,6 +108,12 @@ scrape_configs:
       - targets: ['opencode-router:8080']
         labels:
           instance: 'rpi4'
+
+  - job_name: 'tavily-router'
+    static_configs:
+      - targets: ['tavily-router:8082']
+        labels:
+          instance: 'rpi4'
 EOF
 
 echo "  Written: prometheus/prometheus.yml"
@@ -217,6 +223,90 @@ DASHBOARD
 
 echo "  Written: datasource, dashboard provider, and dashboard JSON"
 
+# --- Tavily Router dashboard (if tavily-smart-router is running) ---
+cat > "${SCRIPT_DIR}/grafana/provisioning/dashboards/json/tavily-router.json" << 'DASHBOARD'
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(tavily_router_requests_total[5m]))", "legendFormat": "req/s"}],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "title": "Success Rate",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "sum(rate(tavily_router_requests_total{status_group=\"2xx\"}[5m])) / sum(rate(tavily_router_requests_total[5m]))", "legendFormat": "success rate"}],
+      "fieldConfig": {"defaults": {"unit": "percentunit", "thresholds": {"steps": [{"value": null, "color": "red"}, {"value": 0.9, "color": "yellow"}, {"value": 0.95, "color": "green"}]}}}
+    },
+    {
+      "title": "Key Health",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "tavily_router_key_healthy", "legendFormat": "{{key}}"}]
+    },
+    {
+      "title": "Latency P50 / P95 / P99",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, sum(rate(tavily_router_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum(rate(tavily_router_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum(rate(tavily_router_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "title": "Requests by Status",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [{"expr": "sum by (status_group) (rate(tavily_router_requests_total[5m]))", "legendFormat": "{{status_group}}"}]
+    },
+    {
+      "title": "Key Usage",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "targets": [{"expr": "sum by (key) (rate(tavily_router_key_usage_total[5m]))", "legendFormat": "{{key}}"}]
+    },
+    {
+      "title": "Cooldown Events",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "targets": [{"expr": "sum by (key) (rate(tavily_router_key_cooldown_total[5m]))", "legendFormat": "{{key}}"}]
+    },
+    {
+      "title": "Upstream Errors",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "targets": [{"expr": "sum by (error_type) (rate(tavily_router_upstream_errors_total[5m]))", "legendFormat": "{{error_type}}"}]
+    },
+    {
+      "title": "Key Errors",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "targets": [{"expr": "sum by (key) (rate(tavily_router_requests_total{status_group=~\"4xx|5xx\"}[5m]))", "legendFormat": "{{key}}"}]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["tavily", "proxy"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "Tavily Smart Router",
+  "uid": "tavily-router"
+}
+DASHBOARD
+
+echo "  Written: Tavily Router dashboard (shows data when tavily-smart-router is running)"
+
 # Update docker-compose.yml with Grafana password
 sed -i "s/GF_SECURITY_ADMIN_PASSWORD:.*/GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}/" "${SCRIPT_DIR}/docker-compose.yml" 2>/dev/null || true
 
@@ -230,6 +320,7 @@ docker compose build 2>&1 | tail -5
 echo ""
 echo "[6/8] Starting services..."
 
+docker network create smart-routers 2>/dev/null || true
 docker compose down 2>/dev/null || true
 docker compose up -d
 
