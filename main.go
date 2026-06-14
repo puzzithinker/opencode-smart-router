@@ -32,6 +32,7 @@ type Config struct {
 	UpstreamURL               string   `json:"upstream_url"`
 	Keys                      []string `json:"keys"`
 	Strategy                  string   `json:"strategy"`
+	AuthCooldownSeconds       int      `json:"auth_cooldown_seconds"`
 	CooldownSeconds           int      `json:"cooldown_seconds"`
 	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
 	AdminUser                 string   `json:"admin_user"`
@@ -64,6 +65,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.CooldownSeconds == 0 {
 		cfg.CooldownSeconds = 60
+	}
+	if cfg.AuthCooldownSeconds == 0 {
+		cfg.AuthCooldownSeconds = 10
 	}
 	if cfg.HealthCheckTimeoutSeconds == 0 {
 		cfg.HealthCheckTimeoutSeconds = 10
@@ -588,7 +592,7 @@ func classifyResponse(resp *http.Response) error {
 	// Transient auth failures (expired tokens, brief service hiccups) should recover automatically.
 	// Only insufficient_quota (parsed from 429 responses) permanently disables a key.
 	if statusCode == 401 || statusCode == 403 {
-		rotator.MarkCooldown(key, time.Duration(cfg.CooldownSeconds)*time.Second)
+		rotator.MarkCooldown(key, time.Duration(cfg.AuthCooldownSeconds)*time.Second)
 		recordMetrics()
 		if holder != nil {
 			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
