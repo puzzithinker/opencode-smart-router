@@ -1,15 +1,20 @@
+# This is a template. setup.sh replaces __WORKINGDIR__ automatically.
+# To install manually:
+#   sed 's|__WORKINGDIR__|/home/youruser/opencode-smart-router|' opencode-router.service | sudo tee /etc/systemd/system/opencode-router.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now opencode-router
 [Unit]
 Description=OpenCode Smart Router
 After=docker.service
-Requires=docker.service
+Wants=docker.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/opencode-router
+WorkingDirectory=__WORKINGDIR__
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
-TimeoutStartSec=0
+TimeoutStartSec=60
 
 [Install]
 WantedBy=multi-user.target

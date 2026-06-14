@@ -16,6 +16,9 @@ echo "============================================="
 echo " One-time setup for Raspberry Pi 4"
 echo "============================================="
 echo ""
+echo "  Project directory: ${SCRIPT_DIR}"
+echo ""
+echo ""
 
 # --- Checks ---
 echo "[1/8] Checking prerequisites..."
@@ -68,9 +71,9 @@ if [ ! -f "$CONFIG_FILE" ]; then
             echo "  ERROR: No keys provided. Set OPENCODE_KEYS and re-run."
             exit 1
         fi
-        # Convert comma-separated to JSON array
+        # Convert comma-separated keys to JSON array entries
         JSON_KEYS=$(echo "$KEYS_INPUT" | sed 's/,/","/g' | sed 's/^/"/;s/$/"/' | sed 's/ //g')
-        sed -i "s/\"sk-opencode-go-your-key-here\"/[$JSON_KEYS]/" "$CONFIG_FILE"
+        sed -i "s/\[\"sk-opencode-go-your-key-here\"\]/[$JSON_KEYS]/" "$CONFIG_FILE"
     else
         # OPENCODE_KEYS is set, use env var (docker-compose passes it through)
         echo "  Using OPENCODE_KEYS from environment (${#OPENCODE_KEYS} chars)"
@@ -289,10 +292,29 @@ echo ""
 echo " The 'OpenCode Smart Router' dashboard is auto-provisioned."
 echo " Find it in Grafana → Dashboards."
 echo ""
-echo " Useful commands:"
+
+# --- Systemd service ---
+echo ""
+echo "[9/9] Installing systemd service..."
+
+SERVICE_FILE="${SCRIPT_DIR}/deploy/systemd/opencode-router.service"
+
+if [ ! -f "$SERVICE_FILE" ]; then
+    echo "  WARNING: systemd unit file not found at ${SERVICE_FILE}"
+    echo "  Skipping systemd setup. You can start services with: docker compose up -d"
+else
+    sed "s|__WORKINGDIR__|${SCRIPT_DIR}|" "$SERVICE_FILE" | sudo tee /etc/systemd/system/opencode-router.service > /dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now opencode-router
+    echo "  systemd service installed and started."
+fi
+
+echo ""
+echo " Manual commands:"
 echo "   docker compose logs -f                    Follow all logs"
 echo "   docker compose logs opencode-router       Router logs only"
-echo "   docker compose restart opencode-router     Restart router"
-echo "   docker compose down                        Stop all services"
-echo "   docker compose up -d                       Start all services"
+echo "   docker compose restart opencode-router    Restart router"
+echo "   docker compose down                       Stop all services"
+echo "   docker compose up -d                      Start all services"
+echo "   sudo systemctl status opencode-router      Service status"
 echo ""
