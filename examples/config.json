@@ -9,6 +9,7 @@
   "strategy": "round_robin",
   "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
+  "quota_cooldown_seconds": 86400,
   "health_check_timeout_seconds": 10,
   "admin_user": "admin",
   "admin_pass": "change-me-in-production",

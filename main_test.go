@@ -823,7 +823,7 @@ func TestTransparentRetry_429AllKeys(t *testing.T) {
 	}
 }
 
-func TestPermanentDisable_insufficientQuota(t *testing.T) {
+func TestMarkDisabledPreventsRecovery(t *testing.T) {
 	setupTestGlobals([]string{"key0"}, "round_robin")
 	rotator.MarkDisabled(rotator.keys[0])
 
@@ -834,6 +834,46 @@ func TestPermanentDisable_insufficientQuota(t *testing.T) {
 	rotator.MarkSuccess(rotator.keys[0])
 	if rotator.keys[0].State != KeyDisabled {
 		t.Error("disabled key should NOT recover after MarkSuccess")
+	}
+}
+
+func TestInsufficientQuotaTriggersLongCooldown(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	body := `{"error":{"message":"insufficient quota","type":"insufficient_quota","code":"insufficient_quota"}}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+
+	resp := &http.Response{
+		StatusCode: 429,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{},
+	}
+
+	err := classifyResponse(resp)
+	if err == nil {
+		t.Error("classifyResponse() should return error for 429 insufficient_quota")
+	}
+
+	key.mu.Lock()
+	if key.State != KeyCooldown {
+		t.Errorf("insufficient_quota should put key in cooldown, got state %d", key.State)
+	}
+	key.mu.Unlock()
+
+	if holder.result == nil {
+		t.Fatal("holder.result should not be nil")
+	}
+	if !holder.result.ShouldRetry {
+		t.Error("ShouldRetry = false, want true for insufficient_quota")
 	}
 }
 
@@ -1205,8 +1245,8 @@ func TestClassifyResponse_429InsufficientQuota(t *testing.T) {
 	}
 
 	key.mu.Lock()
-	if key.State != KeyDisabled {
-		t.Errorf("key state = %d, want %d (disabled)", key.State, KeyDisabled)
+	if key.State != KeyCooldown {
+		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
 	}
 	key.mu.Unlock()
 

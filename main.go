@@ -33,6 +33,7 @@ type Config struct {
 	Keys                      []string `json:"keys"`
 	Strategy                  string   `json:"strategy"`
 	AuthCooldownSeconds       int      `json:"auth_cooldown_seconds"`
+	QuotaCooldownSeconds      int      `json:"quota_cooldown_seconds"`
 	CooldownSeconds           int      `json:"cooldown_seconds"`
 	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
 	AdminUser                 string   `json:"admin_user"`
@@ -68,6 +69,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.AuthCooldownSeconds == 0 {
 		cfg.AuthCooldownSeconds = 10
+	}
+	if cfg.QuotaCooldownSeconds == 0 {
+		cfg.QuotaCooldownSeconds = 86400
 	}
 	if cfg.HealthCheckTimeoutSeconds == 0 {
 		cfg.HealthCheckTimeoutSeconds = 10
@@ -609,12 +613,12 @@ func classifyResponse(resp *http.Response) error {
 
 		var errBody errorBody
 		if json.Unmarshal(bodyBytes, &errBody) == nil && errBody.Error.Code == "insufficient_quota" {
-			rotator.MarkDisabled(key)
+			rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSeconds)*time.Second)
 			recordMetrics()
 			if holder != nil {
 				holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
 			}
-			return fmt.Errorf("key disabled: insufficient_quota")
+			return fmt.Errorf("key cooldown: insufficient_quota")
 		}
 
 		// Regular rate limit
