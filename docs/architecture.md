@@ -63,15 +63,17 @@ Each API key is wrapped in a `KeyEntry` with three possible states:
 | State | Meaning | Transition Trigger |
 |-------|---------|-------------------|
 | `HEALTHY` | Key is available for use | Default state; entered after cooldown expires or on success |
-| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit, 401/403 auth failure, or transport timeout |
-| `DISABLED` | Key is permanently removed from rotation | Entered only on 429 with `insufficient_quota` |
+| `COOLDOWN` | Key is temporarily paused | Entered on 429 rate limit, 401/403 auth failure, or 429 `insufficient_quota` |
+| `DISABLED` | Key is permanently removed from rotation | Only entered via manual admin action |
 
 Transitions:
 
-- `HEALTHY --> COOLDOWN`: Rate limit (429), auth failure (401/403), or timeout
+- `HEALTHY --> COOLDOWN`: Rate limit (429), auth failure (401/403), or quota exhaustion (429 `insufficient_quota`)
 - `COOLDOWN --> HEALTHY`: Cooldown period expires (checked at pick time)
-- `HEALTHY --> DISABLED`: Quota exhaustion (`insufficient_quota` on 429)
-- 401/403 go to COOLDOWN (not DISABLED) because auth failures can be transient
+- Any failure type now triggers cooldown (with different durations), not permanent disable
+- 401/403 cooldown: `auth_cooldown_seconds` (default 10s)
+- 429 rate limit cooldown: `cooldown_seconds` (default 60s) or `Retry-After` header
+- 429 `insufficient_quota` cooldown: `quota_cooldown_seconds` (default 86400s = 24h)
 
 ### Selection Strategies
 
@@ -147,7 +149,7 @@ The `classifyResponse` function maps upstream status codes to actions:
 |-------------|--------|--------|-----------------|
 | 2xx | Forward to client | No | Mark `HEALTHY` |
 | 401 / 403 | Auth failure | Yes (next key) | Mark `COOLDOWN` for `auth_cooldown_seconds` (default 10s) |
-| 429 + `insufficient_quota` | Quota exhausted | Yes (next key) | Mark `DISABLED` |
+| 429 + `insufficient_quota` | Quota exhausted | Yes (next key) | Mark `COOLDOWN` for `quota_cooldown_seconds` (default 24h) |
 | 429 (other) | Rate limited | Yes (next key) | Mark `COOLDOWN` with `Retry-After` or default duration |
 | 5xx | Upstream error | No | None (forward error to client) |
 | Timeout / transport error | Network issue | No | Mark `COOLDOWN` for 10 seconds |

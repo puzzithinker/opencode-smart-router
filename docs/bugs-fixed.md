@@ -160,9 +160,13 @@ if statusCode == 401 || statusCode == 403 {
     rotator.MarkDisabled(key)
 }
 
-// After (transient — cooldown allows recovery)
+// After (transient — cooldown allows recovery, with separate durations)
 if statusCode == 401 || statusCode == 403 {
-    rotator.MarkCooldown(key, time.Duration(cfg.CooldownSeconds)*time.Second)
+    rotator.MarkCooldown(key, time.Duration(cfg.AuthCooldownSeconds)*time.Second)  // default 10s
+}
+// insufficient_quota also uses cooldown now (default 24h), not permanent disable
+if errBody.Error.Code == "insufficient_quota" {
+    rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSeconds)*time.Second)  // default 24h
 }
 ```
 

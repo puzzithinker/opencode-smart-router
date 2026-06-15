@@ -94,6 +94,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
 | `strategy` | string | `round_robin` | `round_robin` or `least_used` |
 | `cooldown_seconds` | int | `60` | Cooldown duration for rate-limited keys (429) |
 | `auth_cooldown_seconds` | int | `10` | Cooldown duration for auth failures (401/403) |
+| `quota_cooldown_seconds` | int | `86400` | Cooldown duration for exhausted quota (429 insufficient_quota). Default 24h, matching typical monthly quota resets |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty string disables admin endpoints |
@@ -167,12 +168,12 @@ Each API key moves through three states:
                     +------------+
                     |  HEALTHY   |
                     +------------+
-                    /    |       \
-        401/403/429 |    |        | insufficient_quota
-          (cooldown)|    |        | (permanent disable)
-                    v    |        v
+                    /    |        \
+        401/403/429 |    |         | insufficient_quota
+          (cooldown)|    |         | (long cooldown, default 24h)
+                    v    |         v
               +----------+  +----------+
-              | COOLDOWN |  | DISABLED |
+              | COOLDOWN |  | DISABLED |  (manual disable only)
               +----------+  +----------+
                     |
            cooldown expires
@@ -185,8 +186,8 @@ Each API key moves through three states:
 | State | Meaning |
 |-------|---------|
 | `HEALTHY` | Key is available for use. This is the default state. |
-| `COOLDOWN` | Key is temporarily paused after a rate limit (429), auth failure (401/403), or timeout. It returns to healthy automatically when the cooldown period expires. |
-| `DISABLED` | Key is permanently removed from rotation after quota exhaustion (`insufficient_quota`). Auth failures (401/403) trigger cooldown, not disable, since they can be transient. |
+| `COOLDOWN` | Key is temporarily paused. Duration depends on the trigger: 401/403 → 10s, 429 rate limit → 60s (or `Retry-After`), 429 `insufficient_quota` → 24h. Keys auto-recover when cooldown expires. |
+| `DISABLED` | Key is permanently removed from rotation. Only entered via manual admin action. Keys never auto-recover from disabled. |
 
 ## Transparent Retry
 
