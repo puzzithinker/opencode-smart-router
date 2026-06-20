@@ -17,8 +17,12 @@ The project ships as a single static binary with one external dependency (Promet
 
 - **Round robin and least-used key rotation** with automatic failover
 - **Transparent retry** on 429, 401, and 403 responses
+- **SSE streaming support** — `text/event-stream` responses pass through with flushing, no buffering
 - **Key state machine** that tracks healthy, cooldown, and disabled keys
 - **Real health check** that probes the upstream API with a live key
+- **Split health/readiness probes** — liveness (`/health`) is free; readiness (`/ready`) is cached
+- **Request body size limiting** to prevent memory exhaustion
+- **Upstream timeout** with configurable header response timeout
 - **Admin stats endpoint** with basic auth for key monitoring
 - **Prometheus metrics** for requests, key usage, health, and latency
 - **Graceful shutdown** with in-flight request draining
@@ -96,6 +100,9 @@ Configuration is loaded from `config.json` by default. Override the path with th
 | `auth_cooldown_seconds` | int | `10` | Cooldown duration for auth failures (401/403) |
 | `quota_cooldown_seconds` | int | `86400` | Cooldown duration for exhausted quota (429 insufficient_quota). Default 24h, matching typical monthly quota resets |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
+| `upstream_timeout_seconds` | int | `60` | Timeout for upstream response headers. Prevents hanging when upstream is unresponsive |
+| `max_request_body_bytes` | int | `10485760` | Maximum request body size in bytes (10 MB default). Protects against memory exhaustion. `0` disables the limit |
+| `ready_check_cache_seconds` | int | `30` | How long to cache the `/ready` upstream check result. Prevents rate-limit consumption from frequent probes |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty string disables admin endpoints |
 | `enable_prometheus` | bool | `false` | Enable `/metrics` endpoint |
@@ -117,15 +124,19 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "upstream_url": "https://opencode.ai/zen/go",
   "keys": ["sk-opencode-go-your-key-here"],
   "strategy": "round_robin",
-"cooldown_seconds": 60,
+  "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
+  "upstream_timeout_seconds": 60,
+  "max_request_body_bytes": 10485760,
+  "ready_check_cache_seconds": 30,
   "admin_user": "admin",
   "admin_pass": "",
   "enable_prometheus": false,
   "enable_logging": false,
   "log_file": ""
 }
+```
 
 ### Full Example Config
 
@@ -142,6 +153,9 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
+  "upstream_timeout_seconds": 60,
+  "max_request_body_bytes": 10485760,
+  "ready_check_cache_seconds": 30,
   "admin_user": "admin",
   "admin_pass": "change-me-in-production",
   "enable_prometheus": true,
@@ -149,6 +163,16 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "log_file": "/var/log/opencode-router.log"
 }
 ```
+
+## SSE Streaming
+
+The router detects streaming requests by checking for `"stream": true` in the request body or `Accept: text/event-stream` in the headers. When a streaming request is detected:
+
+- Response bytes are forwarded to the client incrementally with `http.Flusher` — no buffering.
+- The `X-Accel-Buffering: no` header is set to prevent nginx from buffering the stream.
+- Retry only happens if the first upstream attempt returns a retryable status (429, 401, 403) **before** any bytes are streamed to the client. Once streaming begins, retry is no longer possible (the client has already received partial output).
+
+Non-streaming requests continue to use the buffered path for full retry transparency.
 
 ## Key Rotation Strategies
 
@@ -217,12 +241,24 @@ When all keys are exhausted, the router returns a 429 (or 401/403 if the last fa
 
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
-| `/v1/*` | Any | None | Proxied to the upstream OpenCode Go API. The router injects `Authorization: Bearer <key>` automatically. |
-| `/health` | GET | None | Returns router health and upstream connectivity. HTTP 200 if reachable, 503 if not. |
+| `/v1/*` | Any | None | Proxied to the upstream OpenCode Go API. The router injects `Authorization: Bearer <key>` automatically. SSE streaming responses (`text/event-stream`) are forwarded with flushing — no buffering. |
+| `/health` | GET | None | Liveness probe. Returns 200 if the router process is alive and has at least one non-disabled key. Does **not** call upstream — safe for high-frequency probes. |
+| `/ready` | GET | None | Readiness probe. Checks upstream connectivity with a live key. Result is cached for `ready_check_cache_seconds` (default 30s) to avoid consuming rate limit budget. HTTP 200 if upstream reachable, 503 if not. |
 | `/admin/stats` | GET | Basic Auth | JSON snapshot of all keys with masked identifiers, states, usage counts, and last used timestamps. |
 | `/metrics` | GET | None | Prometheus metrics. Only available when `enable_prometheus` is `true`. |
 
-### Health Response
+### Health Response (Liveness)
+
+```json
+{
+  "status": "alive",
+  "healthy_keys": 3,
+  "total_keys": 3,
+  "disabled_keys": 0
+}
+```
+
+### Ready Response (Readiness)
 
 ```json
 {

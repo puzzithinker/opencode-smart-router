@@ -25,6 +25,9 @@ func setupTestGlobals(keys []string, strategy string) {
 		Strategy:                  strategy,
 		CooldownSeconds:           60,
 		HealthCheckTimeoutSeconds: 10,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
 		AdminUser:                 "admin",
 		AdminPass:                 "testpass",
 		EnablePrometheus:          false,
@@ -32,6 +35,7 @@ func setupTestGlobals(keys []string, strategy string) {
 		LogFile:                   "",
 	}
 	rotator = NewKeyRotator(keys, strategy)
+	resetReadyCache()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
@@ -43,6 +47,9 @@ func setupTestGlobalsNoAuth(keys []string, strategy string) {
 		Strategy:                  strategy,
 		CooldownSeconds:           60,
 		HealthCheckTimeoutSeconds: 10,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
 		AdminUser:                 "admin",
 		AdminPass:                 "",
 		EnablePrometheus:          false,
@@ -50,6 +57,7 @@ func setupTestGlobalsNoAuth(keys []string, strategy string) {
 		LogFile:                   "",
 	}
 	rotator = NewKeyRotator(keys, strategy)
+	resetReadyCache()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
@@ -629,7 +637,7 @@ func TestHealthHandler_AllKeysDisabled(t *testing.T) {
 	}
 }
 
-func TestHealthHandler_UpstreamUnreachable(t *testing.T) {
+func TestReadyHandler_UpstreamUnreachable(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
@@ -642,24 +650,28 @@ func TestHealthHandler_UpstreamUnreachable(t *testing.T) {
 		Strategy:                  "round_robin",
 		CooldownSeconds:           60,
 		HealthCheckTimeoutSeconds: 5,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
 		AdminUser:                 "admin",
 		AdminPass:                 "testpass",
 		EnablePrometheus:          false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	resetReadyCache()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	req := httptest.NewRequest("GET", "/health", nil)
+	req := httptest.NewRequest("GET", "/ready", nil)
 	w := httptest.NewRecorder()
 
-	healthHandler(w, req)
+	readyHandler(w, req)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 	}
 }
 
-func TestHealthHandler_HealthyUpstream(t *testing.T) {
+func TestReadyHandler_HealthyUpstream(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"data":[]}`)) //nolint:errcheck
@@ -673,17 +685,21 @@ func TestHealthHandler_HealthyUpstream(t *testing.T) {
 		Strategy:                  "round_robin",
 		CooldownSeconds:           60,
 		HealthCheckTimeoutSeconds: 5,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
 		AdminUser:                 "admin",
 		AdminPass:                 "testpass",
 		EnablePrometheus:          false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	resetReadyCache()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	req := httptest.NewRequest("GET", "/health", nil)
+	req := httptest.NewRequest("GET", "/ready", nil)
 	w := httptest.NewRecorder()
 
-	healthHandler(w, req)
+	readyHandler(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
@@ -698,6 +714,91 @@ func TestHealthHandler_HealthyUpstream(t *testing.T) {
 	}
 	if result["upstream"] != "reachable" {
 		t.Errorf("upstream = %v, want reachable", result["upstream"])
+	}
+}
+
+func TestReadyHandler_CachesResult(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"data":[]}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:               upstreamURL.String(),
+		Keys:                      []string{"key0"},
+		Strategy:                  "round_robin",
+		CooldownSeconds:           60,
+		HealthCheckTimeoutSeconds: 5,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
+		AdminUser:                 "admin",
+		AdminPass:                 "testpass",
+		EnablePrometheus:          false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	resetReadyCache()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("GET", "/ready", nil)
+		w := httptest.NewRecorder()
+		readyHandler(w, req)
+	}
+
+	if callCount != 1 {
+		t.Errorf("upstream called %d times, want 1 (cached for 30s)", callCount)
+	}
+}
+
+func TestHealthHandler_LivenessNoUpstreamCall(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:               upstreamURL.String(),
+		Keys:                      []string{"key0"},
+		Strategy:                  "round_robin",
+		CooldownSeconds:           60,
+		HealthCheckTimeoutSeconds: 5,
+		UpstreamTimeoutSeconds:    60,
+		MaxRequestBodyBytes:       10 * 1024 * 1024,
+		ReadyCheckCacheSeconds:    30,
+		AdminUser:                 "admin",
+		AdminPass:                 "testpass",
+		EnablePrometheus:          false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	resetReadyCache()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+
+	healthHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if callCount != 0 {
+		t.Errorf("upstream called %d times, want 0 (liveness must not call upstream)", callCount)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result["status"] != "alive" {
+		t.Errorf("status = %v, want alive", result["status"])
 	}
 }
 
@@ -731,7 +832,7 @@ func TestTransparentRetry_429ThenSuccess(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
@@ -768,7 +869,7 @@ func TestTransparentRetry_401AllKeys(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
@@ -809,7 +910,7 @@ func TestTransparentRetry_429AllKeys(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
@@ -897,7 +998,7 @@ func TestForward5xxWithoutRetry(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
@@ -1118,9 +1219,9 @@ func TestClassifyResponse_2xx(t *testing.T) {
 		t.Errorf("classifyResponse() error = %v, want nil for 2xx", err)
 	}
 
-key.mu.Lock()
-	if key.State != KeyCooldown {
-		t.Errorf("key state = %d, want %d (cooldown)", key.State, KeyCooldown)
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("key state = %d, want %d (healthy after 2xx success)", key.State, KeyHealthy)
 	}
 	key.mu.Unlock()
 
@@ -1352,7 +1453,7 @@ func TestProxyHandler_SingleKeySuccess(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
@@ -1396,7 +1497,7 @@ func TestProxyHandler_RequestBodyPreservedOnRetry(t *testing.T) {
 	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, 60)
 	handler := proxyHandler(rp, rotator)
 
 	originalBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`
@@ -1419,5 +1520,246 @@ func TestProxyHandler_RequestBodyPreservedOnRetry(t *testing.T) {
 	}
 	if bodies[1] != originalBody {
 		t.Errorf("second request body = %q, want %q (should be preserved on retry)", bodies[1], originalBody)
+	}
+}
+
+// --- Streaming (SSE) Tests ---
+
+func TestIsStreamingRequest(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      []byte
+		acceptHdr string
+		want      bool
+	}{
+		{"stream true in body", []byte(`{"model":"gpt-4","stream":true}`), "", true},
+		{"stream false in body", []byte(`{"model":"gpt-4","stream":false}`), "", false},
+		{"no stream field", []byte(`{"model":"gpt-4"}`), "", false},
+		{"nil body", nil, "", false},
+		{"accept event-stream", nil, "text/event-stream", true},
+		{"accept json", nil, "application/json", false},
+		{"invalid json body", []byte(`{invalid`), "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			if tt.acceptHdr != "" {
+				h.Set("Accept", tt.acceptHdr)
+			}
+			got := isStreamingRequest(tt.body, h)
+			if got != tt.want {
+				t.Errorf("isStreamingRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStreamingResponse_ForwardedDirectly(t *testing.T) {
+	sseChunks := []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+		"data: [DONE]\n\n",
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		for _, chunk := range sseChunks {
+			w.Write([]byte(chunk)) //nolint:errcheck
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+
+	expected := strings.Join(sseChunks, "")
+	if w.Body.String() != expected {
+		t.Errorf("body = %q, want %q", w.Body.String(), expected)
+	}
+}
+
+func TestStreamingResponse_RetryOn429BeforeStream(t *testing.T) {
+	callCount := 0
+	sseResponse := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		auth := r.Header.Get("Authorization")
+		if auth == "Bearer key0" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"rate limit","type":"rate_limit","code":"rate_limit_exceeded"}}`)) //nolint:errcheck
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseResponse)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0", "key1"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (should retry 429 then stream)", w.Code, http.StatusOK)
+	}
+	if callCount < 2 {
+		t.Errorf("callCount = %d, want at least 2 (retry then success)", callCount)
+	}
+	if w.Body.String() != sseResponse {
+		t.Errorf("body = %q, want %q (SSE stream)", w.Body.String(), sseResponse)
+	}
+}
+
+// --- Body Limit Tests ---
+
+func TestRequestBodyLimit_RejectsOversizedBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"ok"}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	cfg.MaxRequestBodyBytes = 100
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	oversizedBody := strings.Repeat("x", 200)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(oversizedBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d (body exceeds limit)", w.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestRequestBodyLimit_AllowsUnderLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"ok"}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:      upstreamURL.String(),
+		Keys:             []string{"key0"},
+		Strategy:         "round_robin",
+		CooldownSeconds:  60,
+		AdminUser:        "admin",
+		AdminPass:        "testpass",
+		EnablePrometheus: false,
+	}
+	cfg.MaxRequestBodyBytes = 1024
+	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	smallBody := `{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(smallBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (body under limit)", w.Code, http.StatusOK)
+	}
+}
+
+// --- Config Default Tests for New Fields ---
+
+func TestLoadConfigNewFieldDefaults(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	config := `{"keys": ["sk-test-key"]}`
+	if _, err := tmpFile.WriteString(config); err != nil {
+		t.Fatal(err)
+	}
+	tmpFile.Close()
+
+	cfg, err := LoadConfig(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+
+	if cfg.UpstreamTimeoutSeconds != 60 {
+		t.Errorf("UpstreamTimeoutSeconds = %d, want 60", cfg.UpstreamTimeoutSeconds)
+	}
+	if cfg.MaxRequestBodyBytes != 10*1024*1024 {
+		t.Errorf("MaxRequestBodyBytes = %d, want %d", cfg.MaxRequestBodyBytes, 10*1024*1024)
+	}
+	if cfg.ReadyCheckCacheSeconds != 30 {
+		t.Errorf("ReadyCheckCacheSeconds = %d, want 30", cfg.ReadyCheckCacheSeconds)
 	}
 }

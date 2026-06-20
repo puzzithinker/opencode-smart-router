@@ -12,11 +12,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"syscall"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -36,6 +36,9 @@ type Config struct {
 	QuotaCooldownSeconds      int      `json:"quota_cooldown_seconds"`
 	CooldownSeconds           int      `json:"cooldown_seconds"`
 	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
+	UpstreamTimeoutSeconds    int      `json:"upstream_timeout_seconds"`
+	MaxRequestBodyBytes       int64    `json:"max_request_body_bytes"`
+	ReadyCheckCacheSeconds    int      `json:"ready_check_cache_seconds"`
 	AdminUser                 string   `json:"admin_user"`
 	AdminPass                 string   `json:"admin_pass"`
 	EnablePrometheus          bool     `json:"enable_prometheus"`
@@ -75,6 +78,15 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.HealthCheckTimeoutSeconds == 0 {
 		cfg.HealthCheckTimeoutSeconds = 10
+	}
+	if cfg.UpstreamTimeoutSeconds == 0 {
+		cfg.UpstreamTimeoutSeconds = 60
+	}
+	if cfg.MaxRequestBodyBytes == 0 {
+		cfg.MaxRequestBodyBytes = 10 * 1024 * 1024 // 10 MB
+	}
+	if cfg.ReadyCheckCacheSeconds == 0 {
+		cfg.ReadyCheckCacheSeconds = 30
 	}
 
 	// Env override for keys
@@ -116,7 +128,7 @@ func (c *Config) Validate() error {
 type KeyState int
 
 const (
-	KeyHealthy  KeyState = iota
+	KeyHealthy KeyState = iota
 	KeyCooldown
 	KeyDisabled
 )
@@ -409,8 +421,97 @@ func (b *bufferedResponseWriter) writeTo(w http.ResponseWriter) {
 	}
 }
 
-func newReverseProxy(upstreamURL *url.URL) *httputil.ReverseProxy {
+// streamingResponseWriter forwards responses to the client with flushing for
+// SSE streaming. Retryable status codes (429/401/403) are buffered so the
+// retry loop can discard and try the next key; once a non-retryable response
+// starts streaming, the "flushed" flag is set and retry becomes impossible.
+type streamingResponseWriter struct {
+	header     http.Header
+	statusCode int
+	wroteCode  bool
+	flushed    bool
+	upstream   http.ResponseWriter
+	discard    bytes.Buffer
+}
+
+func newStreamingResponseWriter(w http.ResponseWriter) *streamingResponseWriter {
+	return &streamingResponseWriter{
+		header:   make(http.Header),
+		upstream: w,
+	}
+}
+
+func (s *streamingResponseWriter) Header() http.Header {
+	return s.header
+}
+
+func (s *streamingResponseWriter) WriteHeader(code int) {
+	if s.wroteCode {
+		return
+	}
+	s.statusCode = code
+	s.wroteCode = true
+}
+
+func (s *streamingResponseWriter) isRetryable() bool {
+	return s.statusCode == 429 || s.statusCode == 401 || s.statusCode == 403
+}
+
+func (s *streamingResponseWriter) Write(data []byte) (int, error) {
+	if !s.wroteCode {
+		s.WriteHeader(http.StatusOK)
+	}
+
+	if s.isRetryable() {
+		return s.discard.Write(data)
+	}
+
+	if !s.flushed {
+		for k, v := range s.header {
+			s.upstream.Header()[k] = v
+		}
+		// nginx-specific: disables proxy response buffering for SSE
+		s.upstream.Header().Set("X-Accel-Buffering", "no")
+		s.upstream.WriteHeader(s.statusCode)
+		s.flushed = true
+	}
+
+	n, err := s.upstream.Write(data)
+	if f, ok := s.upstream.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, err
+}
+
+// isStreamingRequest detects SSE requests by checking the Accept header for
+// text/event-stream or the request body for "stream": true.
+func isStreamingRequest(bodyBytes []byte, header http.Header) bool {
+	if header != nil {
+		if strings.Contains(header.Get("Accept"), "text/event-stream") {
+			return true
+		}
+	}
+	if bodyBytes != nil {
+		var probe struct {
+			Stream bool `json:"stream"`
+		}
+		if json.Unmarshal(bodyBytes, &probe) == nil && probe.Stream {
+			return true
+		}
+	}
+	return false
+}
+
+func newReverseProxy(upstreamURL *url.URL, timeoutSeconds int) *httputil.ReverseProxy {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: time.Duration(timeoutSeconds) * time.Second,
+	}
 	rp := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstreamURL)
 			r.SetXForwarded()
@@ -442,16 +543,24 @@ func newReverseProxy(upstreamURL *url.URL) *httputil.ReverseProxy {
 
 func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Buffer the request body for potential retries
+		// MaxBytesReader prevents memory exhaustion from oversized payloads
 		var bodyBytes []byte
 		if r.Body != nil {
+			if cfg.MaxRequestBodyBytes > 0 {
+				r.Body = http.MaxBytesReader(nil, r.Body, cfg.MaxRequestBodyBytes)
+			}
 			var err error
 			bodyBytes, err = io.ReadAll(r.Body)
 			if err != nil {
-				writeOpenAIError(w, "failed to read request body", "server_error", "request_body_read_error", http.StatusInternalServerError)
+				writeOpenAIError(w, "request body too large or unreadable", "server_error", "request_body_read_error", http.StatusRequestEntityTooLarge)
 				return
 			}
 			r.Body.Close()
+		}
+
+		streaming := isStreamingRequest(bodyBytes, r.Header)
+		if streaming {
+			slog.Info("streaming_request", "path", r.URL.Path, "method", r.Method)
 		}
 
 		maxRetries := rotator.TotalCount()
@@ -460,7 +569,6 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			key, err := rotator.PickKey()
 			if err != nil {
-				// All keys exhausted
 				msg := "all API keys are unavailable"
 				errType := "server_error"
 				code := "all_keys_exhausted"
@@ -477,59 +585,63 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 
 			slog.Info("key_selected", "key", key.Key, "strategy", rotator.strategy, "attempt", attempt+1)
 
-			// Create a fresh request for each attempt
 			newReq := r.Clone(r.Context())
 			if bodyBytes != nil {
 				newReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 				newReq.ContentLength = int64(len(bodyBytes))
 			}
 
-			// Store key and classification holder in context
 			holder := &classifyHolder{}
 			ctx := context.WithValue(newReq.Context(), keyCtxKey, key)
 			ctx = context.WithValue(ctx, classifyCtxKey, holder)
 			ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
 			newReq = newReq.WithContext(ctx)
 
-			// Use a buffered response writer so we can retry if needed
-			buf := newBufferedResponseWriter()
+			if streaming {
+				sw := newStreamingResponseWriter(w)
+				rp.ServeHTTP(sw, newReq)
 
+				if holder.result != nil && holder.result.ShouldRetry && !sw.flushed {
+					lastStatusCode = holder.result.StatusCode
+					slog.Info("transparent_retry", "key", key.Key, "status", holder.result.StatusCode, "attempt", attempt+1)
+					continue
+				}
+				return
+			}
+
+			buf := newBufferedResponseWriter()
 			rp.ServeHTTP(buf, newReq)
 
-			// Check classification result
 			if holder.result != nil && holder.result.ShouldRetry {
 				lastStatusCode = holder.result.StatusCode
 				slog.Info("transparent_retry", "key", key.Key, "status", holder.result.StatusCode, "attempt", attempt+1)
-				// Discard buffer and try next key
 				continue
 			}
 
-			// Success or non-retryable error — forward buffered response to client
 			buf.writeTo(w)
 			return
 		}
 
-// All retries exhausted
-	allExhaustedMsg := "all API keys exhausted after retries"
-	allExhaustedType := "server_error"
-	allExhaustedCode := "all_keys_exhausted"
-	allExhaustedStatus := http.StatusTooManyRequests
-	if lastStatusCode == http.StatusUnauthorized || lastStatusCode == http.StatusForbidden {
-		allExhaustedMsg = "authentication failed with all API keys"
-		allExhaustedType = "authentication_error"
-		allExhaustedCode = "auth_failed"
-		allExhaustedStatus = lastStatusCode
-	}
-	writeOpenAIError(w, allExhaustedMsg, allExhaustedType, allExhaustedCode, allExhaustedStatus)
+		allExhaustedMsg := "all API keys exhausted after retries"
+		allExhaustedType := "server_error"
+		allExhaustedCode := "all_keys_exhausted"
+		allExhaustedStatus := http.StatusTooManyRequests
+		if lastStatusCode == http.StatusUnauthorized || lastStatusCode == http.StatusForbidden {
+			allExhaustedMsg = "authentication failed with all API keys"
+			allExhaustedType = "authentication_error"
+			allExhaustedCode = "auth_failed"
+			allExhaustedStatus = lastStatusCode
+		}
+		writeOpenAIError(w, allExhaustedMsg, allExhaustedType, allExhaustedCode, allExhaustedStatus)
 	}
 }
 
 // --- Error Classification ---
 
 type KeyError struct {
-	Op   string
-	Key  string
-	Err  string
+	Op  string
+	Key string
+	Err string
 }
 
 func (e *KeyError) Error() string { return e.Op + ": key " + e.Key + ": " + e.Err }
@@ -653,6 +765,10 @@ func proxyErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 		holder.result = &ClassificationResult{ShouldRetry: false, StatusCode: http.StatusBadGateway}
 	}
 
+	if holder != nil && holder.result != nil && holder.result.ShouldRetry {
+		return
+	}
+
 	writeOpenAIError(w, fmt.Sprintf("upstream error: %s", err.Error()), "server_error", "upstream_error", http.StatusBadGateway)
 }
 
@@ -679,12 +795,61 @@ func basicAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // --- Handlers ---
 
+// healthHandler is the liveness probe. It checks only whether the router
+// process is alive and has at least one non-disabled key. It does NOT call
+// upstream, making it safe for high-frequency probes (e.g. K8s liveness).
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	healthyKeys := rotator.HealthyCount()
+	disabledKeys := rotator.DisabledCount()
+
+	result := map[string]interface{}{
+		"healthy_keys":  healthyKeys,
+		"total_keys":    rotator.TotalCount(),
+		"disabled_keys": disabledKeys,
+	}
+
+	if healthyKeys > 0 {
+		result["status"] = "alive"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	} else {
+		result["status"] = "unhealthy"
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	json.NewEncoder(w).Encode(result) //nolint:errcheck
+}
+
+type readyCacheEntry struct {
+	result    map[string]interface{}
+	status    int
+	checkedAt time.Time
+}
+
+var readyCache = &readyCacheEntry{}
+
+func resetReadyCache() {
+	readyCache = &readyCacheEntry{}
+}
+
+// readyHandler is the readiness probe. It checks upstream connectivity with
+// a live key, caching the result for ready_check_cache_seconds (default 30s)
+// to avoid consuming rate limit budget on frequent probe calls.
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	ttl := time.Duration(cfg.ReadyCheckCacheSeconds) * time.Second
+
+	if ttl > 0 && time.Since(readyCache.checkedAt) < ttl {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(readyCache.status)
+		json.NewEncoder(w).Encode(readyCache.result) //nolint:errcheck
+		return
+	}
+
 	client := &http.Client{
 		Timeout: time.Duration(cfg.HealthCheckTimeoutSeconds) * time.Second,
 	}
 
-	// Try to find a healthy key
 	var key *KeyEntry
 	now := time.Now()
 	for _, entry := range rotator.keys {
@@ -706,9 +871,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if key == nil {
 		result["status"] = "unhealthy"
 		result["upstream"] = "no_healthy_keys"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		cacheAndWriteReadyResult(w, result, http.StatusServiceUnavailable)
 		return
 	}
 
@@ -719,9 +882,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		result["status"] = "unhealthy"
 		result["upstream"] = "url_error"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		cacheAndWriteReadyResult(w, result, http.StatusServiceUnavailable)
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+key.RawKey)
@@ -730,9 +891,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		result["status"] = "unhealthy"
 		result["upstream"] = "unreachable"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(result) //nolint:errcheck
+		cacheAndWriteReadyResult(w, result, http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
@@ -740,15 +899,22 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		result["status"] = "healthy"
 		result["upstream"] = "reachable"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		cacheAndWriteReadyResult(w, result, http.StatusOK)
 	} else {
 		result["status"] = "unhealthy"
 		result["upstream"] = "unreachable"
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
+		cacheAndWriteReadyResult(w, result, http.StatusServiceUnavailable)
 	}
+}
 
+func cacheAndWriteReadyResult(w http.ResponseWriter, result map[string]interface{}, status int) {
+	readyCache = &readyCacheEntry{
+		result:    result,
+		status:    status,
+		checkedAt: time.Now(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(result) //nolint:errcheck
 }
 
@@ -910,7 +1076,7 @@ func main() {
 	cfg, err = LoadConfig(configPath)
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
-	os.Exit(1)
+		os.Exit(1)
 	}
 
 	setupLogging()
@@ -923,18 +1089,21 @@ func main() {
 	upstreamURL, err := url.Parse(cfg.UpstreamURL)
 	if err != nil {
 		slog.Error("failed to parse upstream URL", "error", err)
-	os.Exit(1)
+		os.Exit(1)
 	}
 
-	rp := newReverseProxy(upstreamURL)
+	rp := newReverseProxy(upstreamURL, cfg.UpstreamTimeoutSeconds)
 
 	mux := http.NewServeMux()
 
 	// Proxy handler with transparent retry
 	mux.HandleFunc("/v1/", proxyHandler(rp, rotator))
 
-	// Health endpoint
+	// Liveness probe (no upstream call)
 	mux.HandleFunc("/health", healthHandler)
+
+	// Readiness probe (cached upstream check)
+	mux.HandleFunc("/ready", readyHandler)
 
 	// Admin endpoints with basic auth
 	mux.HandleFunc("/admin/stats", basicAuthMiddleware(statsHandler))
