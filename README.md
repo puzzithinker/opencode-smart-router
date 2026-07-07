@@ -105,6 +105,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
 | `ready_check_cache_seconds` | int | `30` | How long to cache the `/ready` upstream check result. Prevents rate-limit consumption from frequent probes |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty string disables admin endpoints |
+| `disabled_keys` | []int | `[]` | 0-based indices into `keys` that start in the `disabled` state at startup. Survives restarts. Runtime changes via the admin API are in-memory only and are lost on restart unless also added here. |
 | `enable_prometheus` | bool | `false` | Enable `/metrics` endpoint |
 | `enable_logging` | bool | `false` | Enable file logging |
 | `log_file` | string | `""` | Log file path (stdout if empty) |
@@ -190,28 +191,71 @@ Each API key moves through three states:
 
 ```
                     +------------+
-                    |  HEALTHY   |
-                    +------------+
+                    |  HEALTHY   |<----- admin enable (POST /admin/keys/{i}/enable)
+                    +------------+<----- cooldown expires
                     /    |        \
         401/403/429 |    |         | insufficient_quota
           (cooldown)|    |         | (long cooldown, default 24h)
                     v    |         v
               +----------+  +----------+
-              | COOLDOWN |  | DISABLED |  (manual disable only)
+              | COOLDOWN |  | DISABLED |  (admin disable / disabled_keys config)
               +----------+  +----------+
-                    |
-           cooldown expires
-                    v
-              +----------+
-              |  HEALTHY  |
-              +----------+
 ```
 
 | State | Meaning |
 |-------|---------|
 | `HEALTHY` | Key is available for use. This is the default state. |
-| `COOLDOWN` | Key is temporarily paused. Duration depends on the trigger: 401/403 → 10s, 429 rate limit → 60s (or `Retry-After`), 429 `insufficient_quota` → 24h. Keys auto-recover when cooldown expires. |
-| `DISABLED` | Key is permanently removed from rotation. Only entered via manual admin action. Keys never auto-recover from disabled. |
+| `COOLDOWN` | Key is temporarily paused. Duration depends on the trigger: 401/403 → 10s, 429 rate limit → 60s (or `Retry-After`), 429 `insufficient_quota` → 24h, or a manual admin cooldown. Keys auto-recover when cooldown expires. |
+| `DISABLED` | Key is permanently removed from rotation. Entered via the admin disable endpoint or the `disabled_keys` config field. Recovers only via the admin enable endpoint (`POST /admin/keys/{index}/enable`); never auto-recovers. |
+
+## Managing Key State
+
+The router is **reactive** to quota exhaustion — it cannot know a key is near its limit until the upstream returns `429 insufficient_quota`. When that happens the key is cooled down for 24h and the request is transparently retried on another key (see [Transparent Retry](#transparent-retry)), so the client never sees the failure.
+
+To **proactively** stop using a key before it exhausts (for example, when you know from the OpenCode dashboard that a key is at 99% of its quota), use the admin endpoints to disable it. All traffic then shifts to the remaining healthy keys with zero errors.
+
+### Disable a key at runtime
+
+```bash
+curl -u admin:your-admin-pass -X POST http://127.0.0.1:8080/admin/keys/1/disable
+# {"index":1,"masked_key":"sk-ab1...xyz","state":"disabled"}
+```
+
+`{index}` is the 0-based position of the key in the `keys` config array, shown by `/admin/stats`. The key is immediately removed from rotation.
+
+### Make the disable survive restarts
+
+Runtime disables are in-memory. If the router restarts, the key returns to `healthy`. To make a disable durable, also add the index to `disabled_keys` in `config.json`:
+
+```json
+{
+  "keys": ["sk-opencode-go-key1", "sk-opencode-go-key2"],
+  "disabled_keys": [1]
+}
+```
+
+On startup the router marks every index in `disabled_keys` as `disabled`. Validation fails fast if an index is out of range.
+
+### Re-enable a key
+
+When the key's quota resets (e.g. monthly), bring it back:
+
+```bash
+curl -u admin:your-admin-pass -X POST http://127.0.0.1:8080/admin/keys/1/enable
+# {"index":1,"masked_key":"sk-ab1...xyz","state":"healthy"}
+```
+
+Remember to remove the index from `disabled_keys` in config as well, otherwise the next restart will disable it again.
+
+### Temporary cooldown
+
+If you want to pause a key for a fixed window instead of disabling it permanently (it auto-recovers when the window expires):
+
+```bash
+curl -u admin:your-admin-pass -X POST http://127.0.0.1:8080/admin/keys/1/cooldown \
+  -d '{"seconds": 3600}'
+# {"index":1,"masked_key":"sk-ab1...xyz","state":"cooldown","cooldown_seconds":3600}
+```
 
 ## Transparent Retry
 
@@ -244,7 +288,10 @@ When all keys are exhausted, the router returns a 429 (or 401/403 if the last fa
 | `/v1/*` | Any | None | Proxied to the upstream OpenCode Go API. The router injects `Authorization: Bearer <key>` automatically. SSE streaming responses (`text/event-stream`) are forwarded with flushing — no buffering. |
 | `/health` | GET | None | Liveness probe. Returns 200 if the router process is alive and has at least one non-disabled key. Does **not** call upstream — safe for high-frequency probes. |
 | `/ready` | GET | None | Readiness probe. Checks upstream connectivity with a live key. Result is cached for `ready_check_cache_seconds` (default 30s) to avoid consuming rate limit budget. HTTP 200 if upstream reachable, 503 if not. |
-| `/admin/stats` | GET | Basic Auth | JSON snapshot of all keys with masked identifiers, states, usage counts, and last used timestamps. |
+| `/admin/stats` | GET | Basic Auth | JSON snapshot of all keys with masked identifiers, index, states, usage counts, last used, and cooldown expiry timestamps. |
+| `/admin/keys/{index}/disable` | POST | Basic Auth | Permanently remove a key from rotation (sets state to `disabled`). `{index}` is the 0-based position from the `keys` config, visible in `/admin/stats`. In-memory only — add the index to `disabled_keys` in config for restart persistence. |
+| `/admin/keys/{index}/enable` | POST | Basic Auth | Restore a disabled or cooled-down key to `healthy`, returning it to rotation. |
+| `/admin/keys/{index}/cooldown` | POST | Basic Auth | Put a key into temporary cooldown. Request body: `{"seconds": 3600}`. The key auto-recovers to `healthy` when the cooldown expires. |
 | `/metrics` | GET | None | Prometheus metrics. Only available when `enable_prometheus` is `true`. |
 
 ### Health Response (Liveness)
@@ -276,10 +323,12 @@ When all keys are exhausted, the router returns a 429 (or 401/403 if the last fa
 {
   "keys": [
     {
+      "index": 0,
       "masked_key": "sk-ab1...xyz",
       "state": "healthy",
       "usage_count": 42,
-      "last_used": "2024-01-15T10:30:00Z"
+      "last_used": "2024-01-15T10:30:00Z",
+      "cooldown_until": null
     }
   ],
   "total_requests": 42,
