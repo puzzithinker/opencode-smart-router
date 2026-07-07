@@ -12,6 +12,7 @@
   "ready_check_cache_seconds": 30,
   "admin_user": "admin",
   "admin_pass": "",
+  "disabled_keys": [],
   "enable_prometheus": false,
   "enable_logging": false,
   "log_file": ""

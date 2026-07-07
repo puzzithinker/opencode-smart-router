@@ -41,6 +41,7 @@ type Config struct {
 	ReadyCheckCacheSeconds    int      `json:"ready_check_cache_seconds"`
 	AdminUser                 string   `json:"admin_user"`
 	AdminPass                 string   `json:"admin_pass"`
+	DisabledKeyIndices        []int    `json:"disabled_keys"`
 	EnablePrometheus          bool     `json:"enable_prometheus"`
 	EnableLogging             bool     `json:"enable_logging"`
 	LogFile                   string   `json:"log_file"`
@@ -119,6 +120,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Strategy != "round_robin" && c.Strategy != "least_used" {
 		return fmt.Errorf("strategy must be 'round_robin' or 'least_used', got: %s", c.Strategy)
+	}
+	for _, idx := range c.DisabledKeyIndices {
+		if idx < 0 || idx >= len(c.Keys) {
+			return fmt.Errorf("disabled_keys index %d out of range [0, %d)", idx, len(c.Keys))
+		}
 	}
 	return nil
 }
@@ -298,6 +304,29 @@ func (kr *KeyRotator) MarkDisabled(key *KeyEntry) {
 	}
 
 	slog.Info("key_disabled", "key", key.Key)
+}
+
+func (kr *KeyRotator) MarkEnabled(key *KeyEntry) {
+	key.mu.Lock()
+	defer key.mu.Unlock()
+	key.State = KeyHealthy
+	key.CooldownUntil = time.Time{}
+
+	if cfg.EnablePrometheus {
+		keyHealthy.WithLabelValues(key.Key).Set(1)
+	}
+
+	slog.Info("key_enabled", "key", key.Key)
+}
+
+func (kr *KeyRotator) ApplyDisabledIndices(indices []int) error {
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(kr.keys) {
+			return fmt.Errorf("disabled key index %d out of range [0, %d)", idx, len(kr.keys))
+		}
+		kr.MarkDisabled(kr.keys[idx])
+	}
+	return nil
 }
 
 func (kr *KeyRotator) HealthyCount() int {
@@ -922,17 +951,23 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	keys := make([]map[string]interface{}, 0, len(rotator.keys))
 	var totalRequests int64
 
-	for _, entry := range rotator.keys {
+	for i, entry := range rotator.keys {
 		entry.mu.Lock()
 		keyStat := map[string]interface{}{
-			"masked_key":  entry.Key,
-			"state":       entry.State.String(),
-			"usage_count": entry.UsageCount,
+			"index":        i,
+			"masked_key":   entry.Key,
+			"state":        entry.State.String(),
+			"usage_count":  entry.UsageCount,
 		}
 		if !entry.LastUsed.IsZero() {
 			keyStat["last_used"] = entry.LastUsed.Format(time.RFC3339)
 		} else {
 			keyStat["last_used"] = nil
+		}
+		if !entry.CooldownUntil.IsZero() {
+			keyStat["cooldown_until"] = entry.CooldownUntil.Format(time.RFC3339)
+		} else {
+			keyStat["cooldown_until"] = nil
 		}
 		totalRequests += entry.UsageCount
 		entry.mu.Unlock()
@@ -947,6 +982,84 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result) //nolint:errcheck
+}
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("failed to write json response", "error", err)
+	}
+}
+
+func parseKeyIndex(r *http.Request) (int, error) {
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		return 0, fmt.Errorf("index must be an integer, got %q", r.PathValue("index"))
+	}
+	if index < 0 || index >= rotator.TotalCount() {
+		return 0, fmt.Errorf("index %d out of range [0, %d)", index, rotator.TotalCount())
+	}
+	return index, nil
+}
+
+func disableKeyHandler(w http.ResponseWriter, r *http.Request) {
+	index, err := parseKeyIndex(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	key := rotator.keys[index]
+	rotator.MarkDisabled(key)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"index":      index,
+		"masked_key": key.Key,
+		"state":      "disabled",
+	})
+}
+
+func enableKeyHandler(w http.ResponseWriter, r *http.Request) {
+	index, err := parseKeyIndex(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	key := rotator.keys[index]
+	rotator.MarkEnabled(key)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"index":      index,
+		"masked_key": key.Key,
+		"state":      "healthy",
+	})
+}
+
+type cooldownRequest struct {
+	Seconds int `json:"seconds"`
+}
+
+func cooldownKeyHandler(w http.ResponseWriter, r *http.Request) {
+	index, err := parseKeyIndex(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	var body cooldownRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body, expected {\"seconds\": N}"})
+		return
+	}
+	if body.Seconds <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "seconds must be a positive integer"})
+		return
+	}
+	key := rotator.keys[index]
+	rotator.MarkCooldown(key, time.Duration(body.Seconds)*time.Second)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"index":            index,
+		"masked_key":        key.Key,
+		"state":            "cooldown",
+		"cooldown_seconds": body.Seconds,
+	})
 }
 
 // --- Metrics ---
@@ -1083,7 +1196,15 @@ func main() {
 
 	rotator = NewKeyRotator(cfg.Keys, cfg.Strategy)
 
+	if err := rotator.ApplyDisabledIndices(cfg.DisabledKeyIndices); err != nil {
+		slog.Error("failed to apply disabled key indices", "error", err)
+		os.Exit(1)
+	}
+
 	slog.Info("startup", "keys", rotator.TotalCount(), "strategy", cfg.Strategy, "listen", cfg.ListenAddr, "upstream", cfg.UpstreamURL)
+	if len(cfg.DisabledKeyIndices) > 0 {
+		slog.Info("startup", "disabled_keys", cfg.DisabledKeyIndices)
+	}
 	slog.Info("startup", "version", version)
 
 	upstreamURL, err := url.Parse(cfg.UpstreamURL)
@@ -1107,6 +1228,9 @@ func main() {
 
 	// Admin endpoints with basic auth
 	mux.HandleFunc("/admin/stats", basicAuthMiddleware(statsHandler))
+	mux.HandleFunc("POST /admin/keys/{index}/disable", basicAuthMiddleware(disableKeyHandler))
+	mux.HandleFunc("POST /admin/keys/{index}/enable", basicAuthMiddleware(enableKeyHandler))
+	mux.HandleFunc("POST /admin/keys/{index}/cooldown", basicAuthMiddleware(cooldownKeyHandler))
 
 	// Prometheus metrics
 	if cfg.EnablePrometheus {

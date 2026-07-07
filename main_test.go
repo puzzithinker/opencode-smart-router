@@ -1763,3 +1763,312 @@ func TestLoadConfigNewFieldDefaults(t *testing.T) {
 		t.Errorf("ReadyCheckCacheSeconds = %d, want 30", cfg.ReadyCheckCacheSeconds)
 	}
 }
+
+// --- MarkEnabled Tests ---
+
+func TestMarkEnabled_RecoversDisabledKey(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	rotator.MarkDisabled(rotator.keys[0])
+	if rotator.keys[0].State != KeyDisabled {
+		t.Fatalf("setup: state = %d, want %d", rotator.keys[0].State, KeyDisabled)
+	}
+
+	rotator.MarkEnabled(rotator.keys[0])
+
+	if rotator.keys[0].State != KeyHealthy {
+		t.Errorf("after MarkEnabled: state = %d, want %d", rotator.keys[0].State, KeyHealthy)
+	}
+	if !rotator.keys[0].CooldownUntil.IsZero() {
+		t.Error("cooldown_until should be zero after MarkEnabled")
+	}
+}
+
+// --- ApplyDisabledIndices Tests ---
+
+func TestApplyDisabledIndices_MarksSpecifiedKeys(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1", "k2"}, "round_robin")
+
+	if err := rotator.ApplyDisabledIndices([]int{0, 2}); err != nil {
+		t.Fatalf("ApplyDisabledIndices error: %v", err)
+	}
+
+	if rotator.keys[0].State != KeyDisabled {
+		t.Errorf("keys[0] state = %d, want %d", rotator.keys[0].State, KeyDisabled)
+	}
+	if rotator.keys[1].State != KeyHealthy {
+		t.Errorf("keys[1] state = %d, want %d", rotator.keys[1].State, KeyHealthy)
+	}
+	if rotator.keys[2].State != KeyDisabled {
+		t.Errorf("keys[2] state = %d, want %d", rotator.keys[2].State, KeyDisabled)
+	}
+}
+
+func TestApplyDisabledIndices_OutOfRange(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	err := rotator.ApplyDisabledIndices([]int{5})
+	if err == nil {
+		t.Fatal("expected error for out-of-range index, got nil")
+	}
+}
+
+// --- Config DisabledKeyIndices Validation ---
+
+func TestConfigValidation_DisabledKeysOutOfRange(t *testing.T) {
+	c := Config{Keys: []string{"k0", "k1"}, Strategy: "round_robin", DisabledKeyIndices: []int{5}}
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for out-of-range disabled_keys index, got nil")
+	}
+}
+
+func TestConfigValidation_DisabledKeysValid(t *testing.T) {
+	c := Config{Keys: []string{"k0", "k1"}, Strategy: "round_robin", DisabledKeyIndices: []int{0, 1}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected error for valid disabled_keys: %v", err)
+	}
+}
+
+// --- Disable Key Handler Tests ---
+
+func TestDisableKeyHandler_ValidIndex(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/1/disable", nil)
+	req.SetPathValue("index", "1")
+	w := httptest.NewRecorder()
+
+	disableKeyHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if rotator.keys[1].State != KeyDisabled {
+		t.Errorf("keys[1] state = %d, want %d", rotator.keys[1].State, KeyDisabled)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result["state"] != "disabled" {
+		t.Errorf("response state = %v, want disabled", result["state"])
+	}
+	if result["index"].(float64) != 1 {
+		t.Errorf("response index = %v, want 1", result["index"])
+	}
+}
+
+func TestDisableKeyHandler_OutOfRange(t *testing.T) {
+	setupTestGlobals([]string{"k0"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/5/disable", nil)
+	req.SetPathValue("index", "5")
+	w := httptest.NewRecorder()
+
+	disableKeyHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestDisableKeyHandler_NonNumericIndex(t *testing.T) {
+	setupTestGlobals([]string{"k0"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/abc/disable", nil)
+	req.SetPathValue("index", "abc")
+	w := httptest.NewRecorder()
+
+	disableKeyHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// --- Enable Key Handler Tests ---
+
+func TestEnableKeyHandler_RecoversDisabledKey(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+	rotator.MarkDisabled(rotator.keys[1])
+
+	req := httptest.NewRequest("POST", "/admin/keys/1/enable", nil)
+	req.SetPathValue("index", "1")
+	w := httptest.NewRecorder()
+
+	enableKeyHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if rotator.keys[1].State != KeyHealthy {
+		t.Errorf("keys[1] state = %d, want %d", rotator.keys[1].State, KeyHealthy)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result["state"] != "healthy" {
+		t.Errorf("response state = %v, want healthy", result["state"])
+	}
+}
+
+func TestEnableKeyHandler_OutOfRange(t *testing.T) {
+	setupTestGlobals([]string{"k0"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/9/enable", nil)
+	req.SetPathValue("index", "9")
+	w := httptest.NewRecorder()
+
+	enableKeyHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// --- Cooldown Key Handler Tests ---
+
+func TestCooldownKeyHandler_ValidBody(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/0/cooldown", strings.NewReader(`{"seconds": 3600}`))
+	req.SetPathValue("index", "0")
+	w := httptest.NewRecorder()
+
+	cooldownKeyHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if rotator.keys[0].State != KeyCooldown {
+		t.Errorf("keys[0] state = %d, want %d", rotator.keys[0].State, KeyCooldown)
+	}
+	if !rotator.keys[0].CooldownUntil.After(time.Now().Add(3500 * time.Second)) {
+		t.Error("cooldown_until not set far enough into the future")
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	if result["cooldown_seconds"].(float64) != 3600 {
+		t.Errorf("cooldown_seconds = %v, want 3600", result["cooldown_seconds"])
+	}
+}
+
+func TestCooldownKeyHandler_InvalidJSON(t *testing.T) {
+	setupTestGlobals([]string{"k0"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/0/cooldown", strings.NewReader("not json"))
+	req.SetPathValue("index", "0")
+	w := httptest.NewRecorder()
+
+	cooldownKeyHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+func TestCooldownKeyHandler_NonPositiveSeconds(t *testing.T) {
+	setupTestGlobals([]string{"k0"}, "round_robin")
+
+	req := httptest.NewRequest("POST", "/admin/keys/0/cooldown", strings.NewReader(`{"seconds": 0}`))
+	req.SetPathValue("index", "0")
+	w := httptest.NewRecorder()
+
+	cooldownKeyHandler(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+}
+
+// --- Stats Handler New Fields Tests ---
+
+func TestStatsHandler_IncludesIndexAndCooldownUntil(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+	rotator.MarkCooldown(rotator.keys[1], 60*time.Second)
+
+	req := httptest.NewRequest("GET", "/admin/stats", nil)
+	w := httptest.NewRecorder()
+
+	statsHandler(w, req)
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+	keys := result["keys"].([]interface{})
+
+	key0 := keys[0].(map[string]interface{})
+	if key0["index"].(float64) != 0 {
+		t.Errorf("keys[0] index = %v, want 0", key0["index"])
+	}
+	if key0["cooldown_until"] != nil {
+		t.Errorf("keys[0] cooldown_until = %v, want nil", key0["cooldown_until"])
+	}
+
+	key1 := keys[1].(map[string]interface{})
+	if key1["index"].(float64) != 1 {
+		t.Errorf("keys[1] index = %v, want 1", key1["index"])
+	}
+	if key1["cooldown_until"] == nil {
+		t.Error("keys[1] cooldown_until should be set after MarkCooldown")
+	}
+}
+
+// --- Admin Key Control Mux Routing (E2E) ---
+
+func TestAdminKeyControl_MuxRoutingAndAuth(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /admin/keys/{index}/disable", basicAuthMiddleware(disableKeyHandler))
+	mux.HandleFunc("POST /admin/keys/{index}/enable", basicAuthMiddleware(enableKeyHandler))
+
+	req := httptest.NewRequest("POST", "/admin/keys/1/disable", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no auth: status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+
+	req = httptest.NewRequest("POST", "/admin/keys/1/disable", nil)
+	req.SetBasicAuth("admin", "testpass")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("with auth disable: status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if rotator.keys[1].State != KeyDisabled {
+		t.Errorf("after disable: keys[1] state = %d, want %d", rotator.keys[1].State, KeyDisabled)
+	}
+
+	req = httptest.NewRequest("POST", "/admin/keys/1/enable", nil)
+	req.SetBasicAuth("admin", "testpass")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("with auth enable: status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if rotator.keys[1].State != KeyHealthy {
+		t.Errorf("after enable: keys[1] state = %d, want %d", rotator.keys[1].State, KeyHealthy)
+	}
+}
+
+func TestAdminKeyControl_MuxRejectsWrongMethod(t *testing.T) {
+	setupTestGlobals([]string{"k0", "k1"}, "round_robin")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /admin/keys/{index}/disable", basicAuthMiddleware(disableKeyHandler))
+
+	req := httptest.NewRequest("GET", "/admin/keys/1/disable", nil)
+	req.SetBasicAuth("admin", "testpass")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET on POST-only route: status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
