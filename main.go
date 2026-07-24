@@ -35,6 +35,7 @@ type Config struct {
 	AuthCooldownSeconds       int      `json:"auth_cooldown_seconds"`
 	QuotaCooldownSeconds      int      `json:"quota_cooldown_seconds"`
 	CooldownSeconds           int      `json:"cooldown_seconds"`
+	TimeoutCooldownSeconds    int      `json:"timeout_cooldown_seconds"`
 	HealthCheckTimeoutSeconds int      `json:"health_check_timeout_seconds"`
 	UpstreamTimeoutSeconds    int      `json:"upstream_timeout_seconds"`
 	MaxRequestBodyBytes       int64    `json:"max_request_body_bytes"`
@@ -73,6 +74,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.AuthCooldownSeconds == 0 {
 		cfg.AuthCooldownSeconds = 10
+	}
+	if cfg.TimeoutCooldownSeconds == 0 {
+		cfg.TimeoutCooldownSeconds = 10
 	}
 	if cfg.QuotaCooldownSeconds == 0 {
 		cfg.QuotaCooldownSeconds = 86400
@@ -159,7 +163,11 @@ type KeyEntry struct {
 	CooldownUntil time.Time
 	UsageCount    int64
 	LastUsed      time.Time
-	mu            sync.Mutex
+	// ConsecutiveFailures counts back-to-back failures (5xx, timeout,
+	// transport error, auth, rate limit) since the last success. It drives
+	// the escalating backoff and is reset by MarkSuccess.
+	ConsecutiveFailures int
+	mu                  sync.Mutex
 }
 
 type KeyRotator struct {
@@ -273,12 +281,22 @@ func (kr *KeyRotator) MarkSuccess(key *KeyEntry) {
 	}
 	key.State = KeyHealthy
 	key.CooldownUntil = time.Time{}
+	key.ConsecutiveFailures = 0
 
 	if cfg.EnablePrometheus {
 		keyHealthy.WithLabelValues(key.Key).Set(1)
 	}
 
 	slog.Info("key_recovered", "key", key.Key)
+}
+
+// RecordFailure increments the key's consecutive-failure counter and returns
+// the new count. Callers use the count to compute the backoff cooldown.
+func (kr *KeyRotator) RecordFailure(key *KeyEntry) int {
+	key.mu.Lock()
+	defer key.mu.Unlock()
+	key.ConsecutiveFailures++
+	return key.ConsecutiveFailures
 }
 
 func (kr *KeyRotator) MarkCooldown(key *KeyEntry, duration time.Duration) {
@@ -311,6 +329,7 @@ func (kr *KeyRotator) MarkEnabled(key *KeyEntry) {
 	defer key.mu.Unlock()
 	key.State = KeyHealthy
 	key.CooldownUntil = time.Time{}
+	key.ConsecutiveFailures = 0
 
 	if cfg.EnablePrometheus {
 		keyHealthy.WithLabelValues(key.Key).Set(1)
@@ -383,6 +402,32 @@ func ParseRetryAfter(header string, defaultDuration time.Duration) time.Duration
 	return defaultDuration
 }
 
+// consecutive5xxCooldownThreshold is the number of consecutive 5xx responses
+// after which a key is parked with an escalating backoff cooldown. Below the
+// threshold the request simply fails over to the next key.
+const consecutive5xxCooldownThreshold = 3
+
+const maxFailureCooldown = 5 * time.Minute
+
+// backoffMultipliers scale the base failure cooldown per consecutive failure
+// (1x, 3x, 6x, 12x, 30x — e.g. 10s base yields 10s, 30s, 60s, 120s, 300s).
+var backoffMultipliers = []int{1, 3, 6, 12, 30}
+
+func backoffDuration(base time.Duration, consecutiveFailures int) time.Duration {
+	idx := consecutiveFailures - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(backoffMultipliers) {
+		idx = len(backoffMultipliers) - 1
+	}
+	d := base * time.Duration(backoffMultipliers[idx])
+	if d > maxFailureCooldown {
+		d = maxFailureCooldown
+	}
+	return d
+}
+
 // --- Proxy ---
 
 type contextKey string
@@ -441,6 +486,11 @@ func (b *bufferedResponseWriter) WriteHeader(code int) {
 }
 
 func (b *bufferedResponseWriter) writeTo(w http.ResponseWriter) {
+	// Nothing captured (client cancelled mid-attempt) — do not synthesize a
+	// response; the client is gone and WriteHeader would get code 0.
+	if !b.wroteCode {
+		return
+	}
 	for k, v := range b.header {
 		w.Header()[k] = v
 	}
@@ -451,7 +501,7 @@ func (b *bufferedResponseWriter) writeTo(w http.ResponseWriter) {
 }
 
 // streamingResponseWriter forwards responses to the client with flushing for
-// SSE streaming. Retryable status codes (429/401/403) are buffered so the
+// SSE streaming. Retryable status codes (429/401/403/5xx) are buffered so the
 // retry loop can discard and try the next key; once a non-retryable response
 // starts streaming, the "flushed" flag is set and retry becomes impossible.
 type streamingResponseWriter struct {
@@ -483,7 +533,7 @@ func (s *streamingResponseWriter) WriteHeader(code int) {
 }
 
 func (s *streamingResponseWriter) isRetryable() bool {
-	return s.statusCode == 429 || s.statusCode == 401 || s.statusCode == 403
+	return s.statusCode == 429 || s.statusCode == 401 || s.statusCode == 403 || s.statusCode >= 500
 }
 
 func (s *streamingResponseWriter) Write(data []byte) (int, error) {
@@ -598,17 +648,7 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			key, err := rotator.PickKey()
 			if err != nil {
-				msg := "all API keys are unavailable"
-				errType := "server_error"
-				code := "all_keys_exhausted"
-				statusCode := http.StatusTooManyRequests
-				if lastStatusCode == 401 || lastStatusCode == 403 {
-					statusCode = lastStatusCode
-					msg = "authentication failed with all API keys"
-					errType = "authentication_error"
-					code = "auth_failed"
-				}
-				writeOpenAIError(w, msg, errType, code, statusCode)
+				writeExhaustedError(w, lastStatusCode, "all API keys are unavailable")
 				return
 			}
 
@@ -632,7 +672,7 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 
 				if holder.result != nil && holder.result.ShouldRetry && !sw.flushed {
 					lastStatusCode = holder.result.StatusCode
-					slog.Info("transparent_retry", "key", key.Key, "status", holder.result.StatusCode, "attempt", attempt+1)
+					logRetryEvent(holder.result.StatusCode, key.Key, attempt+1)
 					continue
 				}
 				return
@@ -643,7 +683,7 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 
 			if holder.result != nil && holder.result.ShouldRetry {
 				lastStatusCode = holder.result.StatusCode
-				slog.Info("transparent_retry", "key", key.Key, "status", holder.result.StatusCode, "attempt", attempt+1)
+				logRetryEvent(holder.result.StatusCode, key.Key, attempt+1)
 				continue
 			}
 
@@ -651,18 +691,36 @@ func proxyHandler(rp *httputil.ReverseProxy, rotator *KeyRotator) http.HandlerFu
 			return
 		}
 
-		allExhaustedMsg := "all API keys exhausted after retries"
-		allExhaustedType := "server_error"
-		allExhaustedCode := "all_keys_exhausted"
-		allExhaustedStatus := http.StatusTooManyRequests
-		if lastStatusCode == http.StatusUnauthorized || lastStatusCode == http.StatusForbidden {
-			allExhaustedMsg = "authentication failed with all API keys"
-			allExhaustedType = "authentication_error"
-			allExhaustedCode = "auth_failed"
-			allExhaustedStatus = lastStatusCode
-		}
-		writeOpenAIError(w, allExhaustedMsg, allExhaustedType, allExhaustedCode, allExhaustedStatus)
+		writeExhaustedError(w, lastStatusCode, "all API keys exhausted after retries")
 	}
+}
+
+// logRetryEvent logs failover_retry for 5xx-class retries, transparent_retry otherwise.
+func logRetryEvent(statusCode int, key string, attempt int) {
+	if statusCode >= http.StatusInternalServerError {
+		slog.Info("failover_retry", "key", key, "status", statusCode, "attempt", attempt)
+		return
+	}
+	slog.Info("transparent_retry", "key", key, "status", statusCode, "attempt", attempt)
+}
+
+// writeExhaustedError renders the terminal all-keys-down error; the class of
+// the last failure may override msg and the HTTP status (auth → 401/403, 5xx → 502).
+func writeExhaustedError(w http.ResponseWriter, lastStatusCode int, msg string) {
+	errType := "server_error"
+	code := "all_keys_exhausted"
+	status := http.StatusTooManyRequests
+	switch {
+	case lastStatusCode == http.StatusUnauthorized || lastStatusCode == http.StatusForbidden:
+		status = lastStatusCode
+		msg = "authentication failed with all API keys"
+		errType = "authentication_error"
+		code = "auth_failed"
+	case lastStatusCode >= http.StatusInternalServerError:
+		status = http.StatusBadGateway
+		msg = "all API keys failed with upstream errors"
+	}
+	writeOpenAIError(w, msg, errType, code, status)
 }
 
 // --- Error Classification ---
@@ -724,19 +782,31 @@ func classifyResponse(resp *http.Response) error {
 		return nil
 	}
 
-	// 5xx — upstream problem, don't retry
+	// 5xx — upstream error. Fail over to the next key: under overload the
+	// error may be key-specific (per-key load shedding), so the client
+	// should see a 5xx only after every key has failed.
 	if statusCode >= 500 {
+		failures := rotator.RecordFailure(key)
 		recordMetrics()
-		if holder != nil {
-			holder.result = &ClassificationResult{ShouldRetry: false, StatusCode: statusCode}
+		slog.Warn("upstream_5xx", "key", key.Key, "status", statusCode, "consecutive_failures", failures)
+		if failures >= consecutive5xxCooldownThreshold {
+			cooldown := backoffDuration(time.Duration(cfg.TimeoutCooldownSeconds)*time.Second, failures)
+			if retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"), 0); retryAfter > 0 {
+				cooldown = retryAfter
+			}
+			rotator.MarkCooldown(key, cooldown)
 		}
-		return nil
+		if holder != nil {
+			holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: statusCode}
+		}
+		return fmt.Errorf("upstream server error: status %d", statusCode)
 	}
 
 	// 401/403 — auth failure, treat as transient (cooldown) rather than permanent disable.
 	// Transient auth failures (expired tokens, brief service hiccups) should recover automatically.
 	// Only insufficient_quota (parsed from 429 responses) permanently disables a key.
 	if statusCode == 401 || statusCode == 403 {
+		rotator.RecordFailure(key)
 		rotator.MarkCooldown(key, time.Duration(cfg.AuthCooldownSeconds)*time.Second)
 		recordMetrics()
 		if holder != nil {
@@ -754,6 +824,7 @@ func classifyResponse(resp *http.Response) error {
 
 		var errBody errorBody
 		if json.Unmarshal(bodyBytes, &errBody) == nil && errBody.Error.Code == "insufficient_quota" {
+			rotator.RecordFailure(key)
 			rotator.MarkCooldown(key, time.Duration(cfg.QuotaCooldownSeconds)*time.Second)
 			recordMetrics()
 			if holder != nil {
@@ -763,6 +834,7 @@ func classifyResponse(resp *http.Response) error {
 		}
 
 		// Regular rate limit
+		rotator.RecordFailure(key)
 		retryAfter := ParseRetryAfter(resp.Header.Get("Retry-After"), time.Duration(cfg.CooldownSeconds)*time.Second)
 		rotator.MarkCooldown(key, retryAfter)
 		recordMetrics()
@@ -784,20 +856,39 @@ func proxyErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	key, _ := r.Context().Value(keyCtxKey).(*KeyEntry)
 	holder, _ := r.Context().Value(classifyCtxKey).(*classifyHolder)
 
-	if key != nil {
-		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
-			rotator.MarkCooldown(key, 10*time.Second)
-		}
-	}
-
-	if holder != nil && holder.result == nil {
-		holder.result = &ClassificationResult{ShouldRetry: false, StatusCode: http.StatusBadGateway}
-	}
-
+	// classifyResponse already marked this attempt retryable; the retry loop
+	// owns the next action, so write nothing.
 	if holder != nil && holder.result != nil && holder.result.ShouldRetry {
 		return
 	}
 
+	// Client went away (its own timeout or disconnect): the request context
+	// is done. Not the key's fault — no cooldown, no write to a dead client.
+	if r.Context().Err() != nil {
+		masked := ""
+		if key != nil {
+			masked = key.Key
+		}
+		slog.Info("request_canceled", "key", masked)
+		if holder != nil && holder.result == nil {
+			holder.result = &ClassificationResult{ShouldRetry: false}
+		}
+		return
+	}
+
+	// Transport failure (timeout, refused/reset, DNS) before classification:
+	// park the key with backoff and fail over to the next key.
+	if key != nil {
+		failures := rotator.RecordFailure(key)
+		rotator.MarkCooldown(key, backoffDuration(time.Duration(cfg.TimeoutCooldownSeconds)*time.Second, failures))
+	}
+
+	if holder != nil {
+		holder.result = &ClassificationResult{ShouldRetry: true, StatusCode: http.StatusBadGateway}
+		return
+	}
+
+	// No classification channel to signal a retry through; write the error.
 	writeOpenAIError(w, fmt.Sprintf("upstream error: %s", err.Error()), "server_error", "upstream_error", http.StatusBadGateway)
 }
 
@@ -954,10 +1045,10 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	for i, entry := range rotator.keys {
 		entry.mu.Lock()
 		keyStat := map[string]interface{}{
-			"index":        i,
-			"masked_key":   entry.Key,
-			"state":        entry.State.String(),
-			"usage_count":  entry.UsageCount,
+			"index":       i,
+			"masked_key":  entry.Key,
+			"state":       entry.State.String(),
+			"usage_count": entry.UsageCount,
 		}
 		if !entry.LastUsed.IsZero() {
 			keyStat["last_used"] = entry.LastUsed.Format(time.RFC3339)
@@ -1056,7 +1147,7 @@ func cooldownKeyHandler(w http.ResponseWriter, r *http.Request) {
 	rotator.MarkCooldown(key, time.Duration(body.Seconds)*time.Second)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"index":            index,
-		"masked_key":        key.Key,
+		"masked_key":       key.Key,
 		"state":            "cooldown",
 		"cooldown_seconds": body.Seconds,
 	})

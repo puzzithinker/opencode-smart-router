@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,6 +25,7 @@ func setupTestGlobals(keys []string, strategy string) {
 		Keys:                      keys,
 		Strategy:                  strategy,
 		CooldownSeconds:           60,
+		TimeoutCooldownSeconds:    10,
 		HealthCheckTimeoutSeconds: 10,
 		UpstreamTimeoutSeconds:    60,
 		MaxRequestBodyBytes:       10 * 1024 * 1024,
@@ -46,6 +48,7 @@ func setupTestGlobalsNoAuth(keys []string, strategy string) {
 		Keys:                      keys,
 		Strategy:                  strategy,
 		CooldownSeconds:           60,
+		TimeoutCooldownSeconds:    10,
 		HealthCheckTimeoutSeconds: 10,
 		UpstreamTimeoutSeconds:    60,
 		MaxRequestBodyBytes:       10 * 1024 * 1024,
@@ -978,8 +981,58 @@ func TestInsufficientQuotaTriggersLongCooldown(t *testing.T) {
 	}
 }
 
-func TestForward5xxWithoutRetry(t *testing.T) {
+func TestFailoverOn5xx(t *testing.T) {
+	callCount := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if r.Header.Get("Authorization") == "Bearer key0" {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte(`{"error":{"message":"bad gateway"}}`)) //nolint:errcheck
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-123"}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:            upstreamURL.String(),
+		Keys:                   []string{"key0", "key1"},
+		Strategy:               "round_robin",
+		CooldownSeconds:        60,
+		TimeoutCooldownSeconds: 10,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (502 on key0 should fail over to key1)", w.Code, http.StatusOK)
+	}
+	if callCount < 2 {
+		t.Errorf("callCount = %d, want at least 2 (failover should hit key1)", callCount)
+	}
+	if body := w.Body.String(); body != `{"id":"chatcmpl-123"}` {
+		t.Errorf("body = %q, want key1's success response", body)
+	}
+}
+
+func TestAllKeys5xx_Returns502(t *testing.T) {
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte(`{"error":{"message":"bad gateway"}}`)) //nolint:errcheck
 	}))
@@ -987,13 +1040,14 @@ func TestForward5xxWithoutRetry(t *testing.T) {
 
 	upstreamURL, _ := url.Parse(upstream.URL)
 	cfg = &Config{
-		UpstreamURL:      upstreamURL.String(),
-		Keys:             []string{"key0"},
-		Strategy:         "round_robin",
-		CooldownSeconds:  60,
-		AdminUser:        "admin",
-		AdminPass:        "testpass",
-		EnablePrometheus: false,
+		UpstreamURL:            upstreamURL.String(),
+		Keys:                   []string{"key0"},
+		Strategy:               "round_robin",
+		CooldownSeconds:        60,
+		TimeoutCooldownSeconds: 10,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
 	}
 	rotator = NewKeyRotator([]string{"key0"}, "round_robin")
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -1008,11 +1062,28 @@ func TestForward5xxWithoutRetry(t *testing.T) {
 	handler(w, req)
 
 	if w.Code != http.StatusBadGateway {
-		t.Errorf("status = %d, want %d (5xx should be forwarded without retry)", w.Code, http.StatusBadGateway)
+		t.Errorf("status = %d, want %d (all keys failed with 5xx)", w.Code, http.StatusBadGateway)
 	}
 
-	if rotator.keys[0].State != KeyHealthy {
-		t.Error("key should remain healthy after 5xx (upstream problem, not key problem)")
+	var errResp OpenAIError
+	if err := json.Unmarshal(w.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("response should be a router-generated error body: %v", err)
+	}
+	if errResp.Error.Code != "all_keys_exhausted" {
+		t.Errorf("error code = %q, want all_keys_exhausted (router-generated, not upstream's body)", errResp.Error.Code)
+	}
+
+	key := rotator.keys[0]
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Error("below the 5xx threshold, key should remain healthy")
+	}
+	if key.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", key.ConsecutiveFailures)
+	}
+	key.mu.Unlock()
+	if callCount != 1 {
+		t.Errorf("callCount = %d, want 1 (single key = single attempt)", callCount)
 	}
 }
 
@@ -1252,24 +1323,28 @@ func TestClassifyResponse_5xx(t *testing.T) {
 		StatusCode: 500,
 		Request:    req,
 		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     http.Header{},
 	}
 
 	err := classifyResponse(resp)
-	if err != nil {
-		t.Errorf("classifyResponse() error = %v, want nil for 5xx", err)
+	if err == nil {
+		t.Error("classifyResponse() should return error for 5xx (retry signal)")
 	}
 
 	key.mu.Lock()
 	if key.State != KeyHealthy {
-		t.Errorf("key state = %d, want %d (healthy, 5xx should not mark key)", key.State, KeyHealthy)
+		t.Errorf("key state = %d, want %d (first 5xx fails over without cooldown)", key.State, KeyHealthy)
+	}
+	if key.ConsecutiveFailures != 1 {
+		t.Errorf("ConsecutiveFailures = %d, want 1", key.ConsecutiveFailures)
 	}
 	key.mu.Unlock()
 
 	if holder.result == nil {
 		t.Fatal("holder.result should not be nil")
 	}
-	if holder.result.ShouldRetry {
-		t.Error("ShouldRetry = true, want false for 5xx (should not retry)")
+	if !holder.result.ShouldRetry {
+		t.Error("ShouldRetry = false, want true for 5xx (failover to next key)")
 	}
 	if holder.result.StatusCode != 500 {
 		t.Errorf("StatusCode = %d, want 500", holder.result.StatusCode)
@@ -1762,6 +1837,9 @@ func TestLoadConfigNewFieldDefaults(t *testing.T) {
 	if cfg.ReadyCheckCacheSeconds != 30 {
 		t.Errorf("ReadyCheckCacheSeconds = %d, want 30", cfg.ReadyCheckCacheSeconds)
 	}
+	if cfg.TimeoutCooldownSeconds != 10 {
+		t.Errorf("TimeoutCooldownSeconds = %d, want 10", cfg.TimeoutCooldownSeconds)
+	}
 }
 
 // --- MarkEnabled Tests ---
@@ -2070,5 +2148,333 @@ func TestAdminKeyControl_MuxRejectsWrongMethod(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET on POST-only route: status = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+// --- Failover and Backoff Tests (peak-hour 502 incident) ---
+
+func TestBackoffDuration(t *testing.T) {
+	base := 10 * time.Second
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{0, 10 * time.Second}, // defensive: no failure recorded yet
+		{1, 10 * time.Second},
+		{2, 30 * time.Second},
+		{3, 60 * time.Second},
+		{4, 120 * time.Second},
+		{5, 300 * time.Second},
+		{6, 300 * time.Second},   // multiplier capped at last step
+		{100, 300 * time.Second}, // never exceeds maxFailureCooldown
+	}
+	for _, tc := range cases {
+		if got := backoffDuration(base, tc.failures); got != tc.want {
+			t.Errorf("backoffDuration(10s, %d) = %v, want %v", tc.failures, got, tc.want)
+		}
+	}
+}
+
+func TestRecordFailure_Increments(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+
+	for want := 1; want <= 3; want++ {
+		if got := rotator.RecordFailure(key); got != want {
+			t.Errorf("RecordFailure() = %d, want %d", got, want)
+		}
+	}
+}
+
+func TestMarkSuccess_ResetsConsecutiveFailures(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+
+	rotator.RecordFailure(key)
+	rotator.RecordFailure(key)
+	rotator.MarkSuccess(key)
+
+	key.mu.Lock()
+	defer key.mu.Unlock()
+	if key.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0 after success", key.ConsecutiveFailures)
+	}
+	if key.State != KeyHealthy {
+		t.Errorf("State = %v, want healthy after success", key.State)
+	}
+}
+
+func TestClassifyResponse_5xx_CooldownAfterThreshold(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+
+	classify502 := func() {
+		holder := &classifyHolder{}
+		req := httptest.NewRequest("GET", "/v1/chat/completions", nil)
+		ctx := context.WithValue(req.Context(), keyCtxKey, key)
+		ctx = context.WithValue(ctx, classifyCtxKey, holder)
+		ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+		req = req.WithContext(ctx)
+		resp := &http.Response{
+			StatusCode: 502,
+			Request:    req,
+			Body:       io.NopCloser(strings.NewReader("")),
+			Header:     http.Header{},
+		}
+		classifyResponse(resp) //nolint:errcheck
+	}
+
+	classify502()
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("after 1st 5xx: state = %v, want healthy (failover only, no cooldown)", key.State)
+	}
+	key.mu.Unlock()
+
+	classify502()
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("after 2nd 5xx: state = %v, want healthy (below threshold)", key.State)
+	}
+	key.mu.Unlock()
+
+	classify502()
+	key.mu.Lock()
+	defer key.mu.Unlock()
+	if key.State != KeyCooldown {
+		t.Fatalf("after 3rd 5xx: state = %v, want cooldown", key.State)
+	}
+	d := time.Until(key.CooldownUntil)
+	if d < 55*time.Second || d > 65*time.Second {
+		t.Errorf("cooldown = %v, want ~60s (backoff step 3 with 10s base)", d)
+	}
+}
+
+func TestClassifyResponse_5xx_HonorsRetryAfter(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+	rotator.RecordFailure(key)
+	rotator.RecordFailure(key)
+
+	holder := &classifyHolder{}
+	req := httptest.NewRequest("GET", "/v1/chat/completions", nil)
+	ctx := context.WithValue(req.Context(), keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	ctx = context.WithValue(ctx, startTimeCtxKey, time.Now())
+	req = req.WithContext(ctx)
+	resp := &http.Response{
+		StatusCode: 503,
+		Request:    req,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     http.Header{"Retry-After": []string{"120"}},
+	}
+
+	classifyResponse(resp) //nolint:errcheck
+
+	key.mu.Lock()
+	defer key.mu.Unlock()
+	if key.State != KeyCooldown {
+		t.Fatalf("state = %v, want cooldown after 3rd consecutive 5xx", key.State)
+	}
+	d := time.Until(key.CooldownUntil)
+	if d < 115*time.Second || d > 125*time.Second {
+		t.Errorf("cooldown = %v, want ~120s from Retry-After header", d)
+	}
+}
+
+func TestFailoverOnUpstreamTimeout(t *testing.T) {
+	var mu sync.Mutex
+	callCount := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The stalled key0 handler outlives the failover to key1, so the
+		// counter is shared across two concurrent handler goroutines.
+		mu.Lock()
+		callCount++
+		mu.Unlock()
+		if r.Header.Get("Authorization") == "Bearer key0" {
+			time.Sleep(2 * time.Second) // stall past the 1s header timeout
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"ok"}`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:            upstreamURL.String(),
+		Keys:                   []string{"key0", "key1"},
+		Strategy:               "round_robin",
+		CooldownSeconds:        60,
+		TimeoutCooldownSeconds: 10,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 1) // 1s ResponseHeaderTimeout
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	handler(w, req)
+	elapsed := time.Since(start)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (timeout on key0 should fail over to key1)", w.Code, http.StatusOK)
+	}
+	mu.Lock()
+	if callCount < 2 {
+		t.Errorf("callCount = %d, want at least 2 (timeout then failover)", callCount)
+	}
+	mu.Unlock()
+	if elapsed > 1900*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 1.9s (failover at the 1s header timeout, not the 2s stall)", elapsed)
+	}
+
+	key := rotator.keys[0]
+	key.mu.Lock()
+	if key.State != KeyCooldown {
+		t.Error("key0 should be in cooldown after a header timeout")
+	}
+	if key.ConsecutiveFailures != 1 {
+		t.Errorf("key0 ConsecutiveFailures = %d, want 1", key.ConsecutiveFailures)
+	}
+	key.mu.Unlock()
+}
+
+func TestProxyErrorHandler_ClientCancelled(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+	holder := &classifyHolder{}
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	ctx = context.WithValue(ctx, keyCtxKey, key)
+	ctx = context.WithValue(ctx, classifyCtxKey, holder)
+	cancel() // client gave up before the upstream answered
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	proxyErrorHandler(w, req, context.Canceled)
+
+	key.mu.Lock()
+	if key.State != KeyHealthy {
+		t.Errorf("state = %v, want healthy (client cancel is not the key's fault)", key.State)
+	}
+	if key.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0 (cancel must not count as failure)", key.ConsecutiveFailures)
+	}
+	key.mu.Unlock()
+
+	if w.Body.Len() != 0 {
+		t.Error("nothing should be written to a client that is already gone")
+	}
+	if holder.result == nil || holder.result.ShouldRetry {
+		t.Error("holder.result should be a terminal non-retryable result")
+	}
+}
+
+func TestProxyErrorHandler_TransportErrorFailsOver(t *testing.T) {
+	setupTestGlobals([]string{"key0"}, "round_robin")
+	key := rotator.keys[0]
+
+	callHandler := func() *classifyHolder {
+		holder := &classifyHolder{}
+		req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+		ctx := context.WithValue(req.Context(), keyCtxKey, key)
+		ctx = context.WithValue(ctx, classifyCtxKey, holder)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+		proxyErrorHandler(w, req, fmt.Errorf("net/http: timeout awaiting response headers"))
+		if w.Body.Len() != 0 {
+			t.Error("nothing should be written before the retry loop decides")
+		}
+		return holder
+	}
+
+	holder := callHandler()
+	if holder.result == nil || !holder.result.ShouldRetry {
+		t.Fatal("transport error should mark the attempt retryable (failover)")
+	}
+	if holder.result.StatusCode != http.StatusBadGateway {
+		t.Errorf("StatusCode = %d, want 502", holder.result.StatusCode)
+	}
+
+	key.mu.Lock()
+	if key.State != KeyCooldown {
+		t.Errorf("state = %v, want cooldown after transport timeout", key.State)
+	}
+	first := time.Until(key.CooldownUntil)
+	key.mu.Unlock()
+	if first < 9*time.Second || first > 11*time.Second {
+		t.Errorf("first cooldown = %v, want ~10s (backoff step 1)", first)
+	}
+
+	callHandler()
+	key.mu.Lock()
+	second := time.Until(key.CooldownUntil)
+	failures := key.ConsecutiveFailures
+	key.mu.Unlock()
+	if failures != 2 {
+		t.Errorf("ConsecutiveFailures = %d, want 2", failures)
+	}
+	if second < 29*time.Second || second > 31*time.Second {
+		t.Errorf("second cooldown = %v, want ~30s (backoff step 2)", second)
+	}
+}
+
+func TestStreamingResponse_FailoverOn502BeforeStream(t *testing.T) {
+	callCount := 0
+	sseResponse := "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if r.Header.Get("Authorization") == "Bearer key0" {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte(`{"error":{"message":"bad gateway"}}`)) //nolint:errcheck
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(sseResponse)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cfg = &Config{
+		UpstreamURL:            upstreamURL.String(),
+		Keys:                   []string{"key0", "key1"},
+		Strategy:               "round_robin",
+		CooldownSeconds:        60,
+		TimeoutCooldownSeconds: 10,
+		AdminUser:              "admin",
+		AdminPass:              "testpass",
+		EnablePrometheus:       false,
+	}
+	rotator = NewKeyRotator([]string{"key0", "key1"}, "round_robin")
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	rp := newReverseProxy(upstreamURL, 60)
+	handler := proxyHandler(rp, rotator)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d (502 on key0 should fail over, then stream)", w.Code, http.StatusOK)
+	}
+	if callCount < 2 {
+		t.Errorf("callCount = %d, want at least 2 (failover then stream)", callCount)
+	}
+	if w.Body.String() != sseResponse {
+		t.Errorf("body = %q, want %q (SSE stream from key1)", w.Body.String(), sseResponse)
 	}
 }

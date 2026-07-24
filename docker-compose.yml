@@ -10,17 +10,29 @@ services:
       - ./config.json:/config.json:ro
     environment:
       - OPENCODE_KEYS=${OPENCODE_KEYS}
+      # ~90% of the memory limit: Go GC self-tunes to the container cap
+      # instead of meeting the OOM killer under buffered-body spikes.
+      - GOMEMLIMIT=450MiB
     restart: unless-stopped
     networks:
       - routers
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 512M
           cpus: "0.5"
 
   prometheus:
     image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Bound disk usage on the Pi's SD card.
+      - "--storage.tsdb.retention.time=7d"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
@@ -28,29 +40,44 @@ services:
     networks:
       - routers
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
-          memory: 128M
+          memory: 256M
           cpus: "0.25"
 
+  # On-demand only: start with `docker compose --profile grafana up -d`.
+  # Keeps ~170M of RAM free during normal operation.
   grafana:
     image: grafana/grafana:latest
+    profiles:
+      - grafana
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-storage:/var/lib/grafana
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # LAN-reachable: set GRAFANA_ADMIN_PASSWORD in .env — do not keep the default.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
     networks:
       - routers
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     deploy:
       resources:
         limits:
-          memory: 128M
+          memory: 256M
           cpus: "0.25"
 
 networks:

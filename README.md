@@ -16,7 +16,7 @@ The project ships as a single static binary with one external dependency (Promet
 ## Features
 
 - **Round robin and least-used key rotation** with automatic failover
-- **Transparent retry** on 429, 401, and 403 responses
+- **Transparent retry** on 429, 401, and 403 responses, plus failover on 5xx and timeouts with escalating backoff cooldown
 - **SSE streaming support** — `text/event-stream` responses pass through with flushing, no buffering
 - **Key state machine** that tracks healthy, cooldown, and disabled keys
 - **Real health check** that probes the upstream API with a live key
@@ -65,9 +65,16 @@ The router listens on `127.0.0.1:8080` by default.
 docker compose up -d --build
 ```
 
-The container mounts `./config.json` as read-only inside the container. Make sure your `config.json` exists in the project root (copy from `config.example.json` and add your keys).
+This starts the router and Prometheus. Grafana runs on demand via its compose profile (saves ~170 MB RAM on a Pi 4):
 
-Docker Compose binds to `127.0.0.1:8080` with a 256 MB memory limit and 0.5 CPU cap.
+```bash
+docker compose --profile grafana up -d   # start Grafana
+docker compose stop grafana              # stop it again
+```
+
+The container mounts `./config.json` as read-only inside the container. Make sure your `config.json` exists in the project root (copy from `config.example.json` and add your keys). Set `enable_prometheus: true` for the `/metrics` endpoint Prometheus scrapes.
+
+Docker Compose binds port 8080 with a 512 MB memory limit and 0.5 CPU cap; `GOMEMLIMIT=450MiB` keeps the Go GC tuned to the container limit, and container logs rotate at 10 MB × 3 files per service.
 
 ### Using with OpenCode / Hermes Agent
 
@@ -99,6 +106,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
 | `cooldown_seconds` | int | `60` | Cooldown duration for rate-limited keys (429) |
 | `auth_cooldown_seconds` | int | `10` | Cooldown duration for auth failures (401/403) |
 | `quota_cooldown_seconds` | int | `86400` | Cooldown duration for exhausted quota (429 insufficient_quota). Default 24h, matching typical monthly quota resets |
+| `timeout_cooldown_seconds` | int | `10` | Base cooldown for timeouts, transport errors, and repeated 5xx. Escalates with consecutive failures (10s → 30s → 60s → 120s, capped at 5 min) |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
 | `upstream_timeout_seconds` | int | `60` | Timeout for upstream response headers. Prevents hanging when upstream is unresponsive |
 | `max_request_body_bytes` | int | `10485760` | Maximum request body size in bytes (10 MB default). Protects against memory exhaustion. `0` disables the limit |
@@ -127,6 +135,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "strategy": "round_robin",
   "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
+  "timeout_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
   "upstream_timeout_seconds": 60,
   "max_request_body_bytes": 10485760,
@@ -153,6 +162,7 @@ Configuration is loaded from `config.json` by default. Override the path with th
   "strategy": "round_robin",
   "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
+  "timeout_cooldown_seconds": 10,
   "health_check_timeout_seconds": 10,
   "upstream_timeout_seconds": 60,
   "max_request_body_bytes": 10485760,
@@ -171,7 +181,7 @@ The router detects streaming requests by checking for `"stream": true` in the re
 
 - Response bytes are forwarded to the client incrementally with `http.Flusher` — no buffering.
 - The `X-Accel-Buffering: no` header is set to prevent nginx from buffering the stream.
-- Retry only happens if the first upstream attempt returns a retryable status (429, 401, 403) **before** any bytes are streamed to the client. Once streaming begins, retry is no longer possible (the client has already received partial output).
+- Retry only happens if the first upstream attempt returns a retryable status (429, 401, 403, 5xx) **before** any bytes are streamed to the client. Once streaming begins, retry is no longer possible (the client has already received partial output).
 
 Non-streaming requests continue to use the buffered path for full retry transparency.
 
@@ -205,7 +215,7 @@ Each API key moves through three states:
 | State | Meaning |
 |-------|---------|
 | `HEALTHY` | Key is available for use. This is the default state. |
-| `COOLDOWN` | Key is temporarily paused. Duration depends on the trigger: 401/403 → 10s, 429 rate limit → 60s (or `Retry-After`), 429 `insufficient_quota` → 24h, or a manual admin cooldown. Keys auto-recover when cooldown expires. |
+| `COOLDOWN` | Key is temporarily paused. Duration depends on the trigger: 401/403 → 10s, 429 rate limit → 60s (or `Retry-After`), 429 `insufficient_quota` → 24h, a manual admin cooldown, or timeout/transport error and 3+ consecutive 5xx → escalating backoff (10s → 30s → 60s → 120s, 5 min cap). Keys auto-recover when cooldown expires. |
 | `DISABLED` | Key is permanently removed from rotation. Entered via the admin disable endpoint or the `disabled_keys` config field. Recovers only via the admin enable endpoint (`POST /admin/keys/{index}/enable`); never auto-recovers. |
 
 ## Managing Key State
@@ -257,9 +267,9 @@ curl -u admin:your-admin-pass -X POST http://127.0.0.1:8080/admin/keys/1/cooldow
 # {"index":1,"masked_key":"sk-ab1...xyz","state":"cooldown","cooldown_seconds":3600}
 ```
 
-## Transparent Retry
+## Transparent Retry and Failover
 
-When the upstream returns a 429, 401, or 403 status code, the router automatically retries the same request with the next available key. The client sees only one request and one response.
+When the upstream returns a 429, 401, or 403 status code, the router automatically retries the same request with the next available key. The same applies to upstream 5xx responses and transport-level failures (timeouts, connection errors): the request fails over to the next key instead of surfacing a one-shot 502. The client sees only one request and one response.
 
 The retry logic works like this:
 
@@ -268,8 +278,9 @@ The retry logic works like this:
 3. For each attempt, it picks the next available key, forwards the request, and checks the response.
 4. If the response triggers a retry, the buffer is discarded and the loop continues.
 5. If the response succeeds or produces a non-retryable error, it is forwarded to the client.
+6. If the client disconnects or its own timeout fires mid-attempt, the attempt is abandoned without penalizing the key — no cooldown, no error write to a dead client.
 
-When all keys are exhausted, the router returns a 429 (or 401/403 if the last failures were auth errors) with an OpenAI-compatible error body:
+When all keys are exhausted, the router returns a 429 (or 401/403 if the last failures were auth errors, or 502 if the last failures were upstream 5xx/transport errors) with an OpenAI-compatible error body:
 
 ```json
 {
@@ -280,6 +291,8 @@ When all keys are exhausted, the router returns a 429 (or 401/403 if the last fa
   }
 }
 ```
+
+Repeated failures back off exponentially: each key tracks consecutive failures and its timeout/5xx cooldown grows 10s → 30s → 60s → 120s, capped at 5 minutes, resetting on the first success. After 3 consecutive 5xx responses a key is parked with this backoff (honoring `Retry-After` when present), so an overloaded upstream is not hammered by constant re-probing.
 
 ## API Endpoints
 

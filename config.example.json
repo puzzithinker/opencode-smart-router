@@ -5,6 +5,7 @@
   "strategy": "round_robin",
   "cooldown_seconds": 60,
   "auth_cooldown_seconds": 10,
+  "timeout_cooldown_seconds": 10,
   "quota_cooldown_seconds": 86400,
   "health_check_timeout_seconds": 10,
   "upstream_timeout_seconds": 60,

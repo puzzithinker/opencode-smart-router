@@ -68,12 +68,13 @@ Each API key is wrapped in a `KeyEntry` with three possible states:
 
 Transitions:
 
-- `HEALTHY --> COOLDOWN`: Rate limit (429), auth failure (401/403), or quota exhaustion (429 `insufficient_quota`)
+- `HEALTHY --> COOLDOWN`: Rate limit (429), auth failure (401/403), quota exhaustion (429 `insufficient_quota`), transport error/timeout, or 3+ consecutive 5xx responses
 - `COOLDOWN --> HEALTHY`: Cooldown period expires (checked at pick time)
 - Any failure type now triggers cooldown (with different durations), not permanent disable
 - 401/403 cooldown: `auth_cooldown_seconds` (default 10s)
 - 429 rate limit cooldown: `cooldown_seconds` (default 60s) or `Retry-After` header
 - 429 `insufficient_quota` cooldown: `quota_cooldown_seconds` (default 86400s = 24h)
+- Timeout/transport/5xx cooldown: escalating backoff from `timeout_cooldown_seconds` (default 10s → 30s → 60s → 120s, 5 min cap), driven by a per-key consecutive-failure counter that only a successful request resets
 
 ### Selection Strategies
 
@@ -110,7 +111,10 @@ For every outgoing request, the rewrite handler:
 
 ### ErrorHandler
 
-`proxyErrorHandler` catches transport-level failures (connection refused, DNS errors, timeouts). If the error contains "timeout" or "deadline exceeded", the key is moved to `COOLDOWN` for 10 seconds. Transport errors are not retried, the client receives a 502 Bad Gateway with an OpenAI-formatted error body.
+`proxyErrorHandler` catches transport-level failures (connection refused, DNS errors, timeouts). It discriminates by the request context, not the error text:
+
+- **Client cancelled** (`r.Context().Err() != nil` — the caller's own timeout or disconnect fired first): logged as `request_canceled`, no cooldown, no error write (the client is gone).
+- **Transport failure** (timeout, refused/reset, DNS): the key's consecutive-failure counter increments and the key enters `COOLDOWN` with an escalating backoff (base `timeout_cooldown_seconds`, default 10s → 30s → 60s → 120s, capped at 5 minutes). The attempt is marked retryable, so the retry loop fails over to the next key instead of returning a one-shot 502.
 
 ---
 
@@ -133,7 +137,7 @@ The retry logic lives entirely inside `proxyHandler`. It is transparent to the c
    - If `ShouldRetry` is true, discard the buffer and continue to the next key
    - If `ShouldRetry` is false, copy the buffered response to the real `ResponseWriter` and return
 
-4. **Exhaustion**: If all keys are tried and all trigger retries, the handler returns a 429 (or 401/403 if the last failures were auth errors) with an OpenAI-formatted error.
+4. **Exhaustion**: If all keys are tried and all trigger retries, the handler returns a 429 (or 401/403 if the last failures were auth errors, or 502 if the last failures were upstream 5xx/transport errors) with an OpenAI-formatted error.
 
 ### Buffered Response Writer
 
@@ -147,12 +151,13 @@ The `classifyResponse` function maps upstream status codes to actions:
 
 | Status Code | Action | Retry? | Key State Change |
 |-------------|--------|--------|-----------------|
-| 2xx | Forward to client | No | Mark `HEALTHY` |
+| 2xx | Forward to client | No | Mark `HEALTHY`, reset consecutive-failure counter |
 | 401 / 403 | Auth failure | Yes (next key) | Mark `COOLDOWN` for `auth_cooldown_seconds` (default 10s) |
 | 429 + `insufficient_quota` | Quota exhausted | Yes (next key) | Mark `COOLDOWN` for `quota_cooldown_seconds` (default 24h) |
 | 429 (other) | Rate limited | Yes (next key) | Mark `COOLDOWN` with `Retry-After` or default duration |
-| 5xx | Upstream error | No | None (forward error to client) |
-| Timeout / transport error | Network issue | No | Mark `COOLDOWN` for 10 seconds |
+| 5xx | Upstream error | Yes (next key) | Increment failure counter; at 3+ consecutive 5xx, `COOLDOWN` with escalating backoff (or `Retry-After`) |
+| Timeout / transport error | Network issue | Yes (next key) | `COOLDOWN` with escalating backoff, base `timeout_cooldown_seconds` (default 10s) |
+| Client cancelled mid-request | Caller gone | No | None (logged as `request_canceled`) |
 | Other 4xx | Client error | No | None (forward error to client) |
 
 ### Retry-After Parsing
@@ -246,7 +251,7 @@ time=2026-06-13T12:00:04.000Z level=INFO msg=request_forwarded key=sk-cd2...lmn 
 
 When `enable_logging` is true and `log_file` is set, output goes to the specified file. Otherwise, output goes to stdout with the `slog.TextHandler`.
 
-Log events: `key_selected`, `key_cooldown`, `key_disabled`, `key_recovered`, `request_forwarded`, `transparent_retry`, `startup`, `listening`, `shutdown`.
+Log events: `key_selected`, `key_cooldown`, `key_disabled`, `key_recovered`, `request_forwarded`, `transparent_retry`, `failover_retry` (5xx/transport retries), `upstream_5xx`, `request_canceled`, `startup`, `listening`, `shutdown`.
 
 ### Version Injection
 
@@ -291,6 +296,7 @@ Default path is `config.json`. Override with `OPENCODE_CONFIG` environment varia
 | `keys` | []string | (required) | API keys to rotate |
 | `strategy` | string | `round_robin` | `round_robin` or `least_used` |
 | `cooldown_seconds` | int | `60` | Default cooldown duration |
+| `timeout_cooldown_seconds` | int | `10` | Base cooldown for timeouts, transport errors, and repeated 5xx; escalates with consecutive failures (10s → 30s → 60s → 120s, 5 min cap) |
 | `health_check_timeout_seconds` | int | `10` | Timeout for upstream health probe |
 | `admin_user` | string | `admin` | Basic auth username for admin endpoints |
 | `admin_pass` | string | `""` | Basic auth password. Empty string disables admin endpoints |
